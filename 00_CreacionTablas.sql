@@ -49,7 +49,9 @@ CREATE TABLE app.Tbl_Persona (
     dni INT NOT NULL,
     email VARCHAR(100) UNIQUE,
     telefono VARCHAR(12),
-    CBU_CVU CHAR(22) UNIQUE
+    CBU_CVU CHAR(22) UNIQUE,
+    CONSTRAINT CHK_Persona_DNI CHECK (dni > 0 AND dni < 100000000),
+    CONSTRAINT CHK_Persona_Email CHECK (email LIKE '%@%.%' OR email IS NULL)
 );
 GO
 
@@ -58,7 +60,8 @@ CREATE TABLE app.Tbl_Consorcio (
     idConsorcio INT NOT NULL IDENTITY(1,1) PRIMARY KEY,
     nombre VARCHAR(50) NOT NULL,
     direccion VARCHAR(100),
-    superficieTotal  DECIMAL(10,2)
+    superficieTotal DECIMAL(10,2),
+    CONSTRAINT CHK_Consorcio_SuperficieTotal CHECK (superficieTotal > 0 OR superficieTotal IS NULL)
 );
 GO
 
@@ -68,13 +71,24 @@ CREATE TABLE app.Tbl_UnidadFuncional (
     idConsorcio INT NOT NULL,
     piso TINYINT,
     departamento CHAR(1),
-    superficie DECIMAL(7,2), -- superficie de la UF
-    metrosBaulera DECIMAL(5,2), -- 0 => sin baulera
-    metrosCochera DECIMAL(5,2), -- 0 => sin cochera
+    superficie DECIMAL(7,2),
+    metrosBaulera DECIMAL(5,2),
+    metrosCochera DECIMAL(5,2),
     porcentaje DECIMAL(5,2),
+    CBU_CVU CHAR(22),
     CONSTRAINT FK_UnidadFuncional_Consorcio
-        FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio (idConsorcio)
+        FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio (idConsorcio),
+    CONSTRAINT CHK_UF_Superficie CHECK (superficie >= 0 OR superficie IS NULL),
+    CONSTRAINT CHK_UF_MetrosBaulera CHECK (metrosBaulera >= 0 OR metrosBaulera IS NULL),
+    CONSTRAINT CHK_UF_MetrosCochera CHECK (metrosCochera >= 0 OR metrosCochera IS NULL),
+    CONSTRAINT CHK_UF_Porcentaje CHECK ((porcentaje > 0 AND porcentaje <= 100) OR porcentaje IS NULL)
 );
+GO
+
+-- Índice único filtrado para CBU_CVU (permite múltiples NULL)
+CREATE UNIQUE NONCLUSTERED INDEX UQ_UnidadFuncional_CBU_CVU
+ON app.Tbl_UnidadFuncional(CBU_CVU)
+WHERE CBU_CVU IS NOT NULL;
 GO
 
 /* ---- Tbl_UFPersona ---- */
@@ -91,7 +105,8 @@ CREATE TABLE app.Tbl_UFPersona (
     CONSTRAINT FK_UFPersona_UF
         FOREIGN KEY (idUnidadFuncional) REFERENCES app.Tbl_UnidadFuncional (idUnidadFuncional),
     CONSTRAINT FK_UFPersona_Consorcio
-        FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio (idConsorcio)
+        FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio (idConsorcio),
+    CONSTRAINT CHK_UFPersona_Fechas CHECK (fechaFin IS NULL OR fechaFin >= fechaInicio)
 );
 GO
 
@@ -104,7 +119,10 @@ CREATE TABLE app.Tbl_Expensa (
     fechaVto2 DATE,
     montoTotal DECIMAL(10,2),
     CONSTRAINT FK_Expensa_Consorcio
-        FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio (idConsorcio)
+        FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio (idConsorcio),
+    CONSTRAINT CHK_Expensa_FechaVto1 CHECK (fechaVto1 >= fechaGeneracion OR fechaVto1 IS NULL),
+    CONSTRAINT CHK_Expensa_FechaVto2 CHECK (fechaVto2 >= fechaVto1 OR fechaVto2 IS NULL),
+    CONSTRAINT CHK_Expensa_MontoTotal CHECK (montoTotal >= 0 OR montoTotal IS NULL)
 );
 GO
 
@@ -115,12 +133,13 @@ CREATE TABLE app.Tbl_Gasto (
     idConsorcio INT NOT NULL,
     tipo VARCHAR(16) CHECK (tipo IN ('Ordinario','Extraordinario')),
     descripcion VARCHAR(200),
-    fechaEmision DATE,
-    importe DECIMAL(10,2),
+    fechaEmision DATE CONSTRAINT DF_Gasto_FechaEmision DEFAULT GETDATE(),
+    importe DECIMAL(10,2) CONSTRAINT DF_Gasto_Importe DEFAULT 0,
     CONSTRAINT FK_Gasto_Consorcio
         FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio (idConsorcio),
     CONSTRAINT FK_Gasto_Expensa
-        FOREIGN KEY (nroExpensa) REFERENCES app.Tbl_Expensa (nroExpensa)
+        FOREIGN KEY (nroExpensa) REFERENCES app.Tbl_Expensa (nroExpensa),
+    CONSTRAINT CHK_Gasto_Importe CHECK (importe >= 0)
 );
 GO
 
@@ -141,7 +160,10 @@ CREATE TABLE app.Tbl_Gasto_Extraordinario (
     cuotaActual TINYINT,
     cantCuotas TINYINT,
     CONSTRAINT FK_Extraordinario_Gasto
-        FOREIGN KEY (idGasto) REFERENCES app.Tbl_Gasto (idGasto)
+        FOREIGN KEY (idGasto) REFERENCES app.Tbl_Gasto (idGasto),
+    CONSTRAINT CHK_GastoExtra_CuotaActual CHECK (cuotaActual > 0 OR cuotaActual IS NULL),
+    CONSTRAINT CHK_GastoExtra_CantCuotas CHECK (cantCuotas > 0 OR cantCuotas IS NULL),
+    CONSTRAINT CHK_GastoExtra_Cuotas CHECK (cuotaActual <= cantCuotas OR cuotaActual IS NULL OR cantCuotas IS NULL)
 );
 GO
 
@@ -158,15 +180,17 @@ CREATE TABLE app.Tbl_EstadoCuenta (
     expensasOrdinarias DECIMAL(10,2),
     expensasExtraordinarias DECIMAL(10,2),
     totalAPagar DECIMAL(10,2),
-    fecha DATE,
+    fecha DATE CONSTRAINT DF_EstadoCuenta_Fecha DEFAULT GETDATE(),
     CONSTRAINT PK_EstadoCuenta PRIMARY KEY (idEstadoCuenta, nroUnidadFuncional, idConsorcio),
     CONSTRAINT FK_EstadoCuenta_UF
         FOREIGN KEY (nroUnidadFuncional) REFERENCES app.Tbl_UnidadFuncional (idUnidadFuncional),
     CONSTRAINT FK_EstadoCuenta_Expensa
         FOREIGN KEY (nroExpensa) REFERENCES app.Tbl_Expensa (nroExpensa),
     CONSTRAINT FK_EstadoCuenta_Consorcio
-        FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio (idConsorcio)
+        FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio (idConsorcio),
+    CONSTRAINT CHK_EstadoCuenta_InteresMora CHECK (interesMora >= 0 OR interesMora IS NULL)
 );
+GO
 
 /* ---- Tbl_Pago ---- */
 CREATE TABLE app.Tbl_Pago (
@@ -175,13 +199,14 @@ CREATE TABLE app.Tbl_Pago (
     nroUnidadFuncional INT NOT NULL,
     idConsorcio INT NOT NULL,
     nroExpensa INT NOT NULL,
-    fecha  DATE,
+    fecha DATE,
     monto DECIMAL(10,2),
     CBU_CVU VARCHAR(22),
     CONSTRAINT FK_Pago_EstadoCuenta
         FOREIGN KEY (idEstadoCuenta, nroUnidadFuncional, idConsorcio)
         REFERENCES app.Tbl_EstadoCuenta (idEstadoCuenta, nroUnidadFuncional, idConsorcio),
     CONSTRAINT FK_Pago_Expensa
-        FOREIGN KEY (nroExpensa) REFERENCES app.Tbl_Expensa (nroExpensa)
+        FOREIGN KEY (nroExpensa) REFERENCES app.Tbl_Expensa (nroExpensa),
+    CONSTRAINT CHK_Pago_Monto CHECK (monto > 0 OR monto IS NULL)
 );
 GO
