@@ -282,12 +282,6 @@ EXEC importacion.Sp_CargarGastosDesdeExcel
     @Hoja             = N'Proveedores$',
     @UsarFechaExpensa = '19000101';
 
--- SELECT * FROM app.Tbl_Consorcio;
-
--- SELECT * FROM app.Tbl_Gasto;
-
--- SELECT * FROM app.Tbl_Gasto_Ordinario;
-
 IF OBJECT_ID(N'importacion.Sp_CargarConsorcioYUF_DesdeCsv', N'P') IS NOT NULL
     DROP PROCEDURE importacion.Sp_CargarConsorcioYUF_DesdeCsv;
 GO
@@ -310,6 +304,10 @@ BEGIN
             [nroUnidadFuncional]   NVARCHAR(50)  COLLATE Latin1_General_CI_AI NULL,
             [piso]                 NVARCHAR(50)  COLLATE Latin1_General_CI_AI NULL,
             [departamento]         NVARCHAR(50)  COLLATE Latin1_General_CI_AI NULL
+            -- Si tu archivo agrega rol y fechas, podés sumar columnas aquí:
+            -- ,[rol]              NVARCHAR(50)  NULL  -- 'Inquilino'/'Propietario'
+            -- ,[fechaInicio]      NVARCHAR(50)  NULL
+            -- ,[fechaFin]         NVARCHAR(50)  NULL
         );
 
         DECLARE @FirstRow INT = CASE WHEN @HDR=1 THEN 2 ELSE 1 END;
@@ -334,10 +332,14 @@ WITH (
             idUnidadFuncional INT         NOT NULL,
             nombre            VARCHAR(50) COLLATE Latin1_General_CI_AI NOT NULL,
             piso              TINYINT     NULL,
-            departamento      CHAR(1)     COLLATE Latin1_General_CI_AI NULL
+            departamento      CHAR(1)     COLLATE Latin1_General_CI_AI NULL,
+            cbu_cvu_csv       VARCHAR(30) NULL
+            --,rolCsv          VARCHAR(50) NULL
+            --,fechaInicioCsv  DATE        NULL
+            --,fechaFinCsv     DATE        NULL
         );
 
-        INSERT INTO #Stg (idUnidadFuncional, nombre, piso, departamento)
+        INSERT INTO #Stg (idUnidadFuncional, nombre, piso, departamento, cbu_cvu_csv /*,rolCsv,fechaInicioCsv,fechaFinCsv*/)
         SELECT
             idUnidadFuncional = TRY_CONVERT(INT, NULLIF(LTRIM(RTRIM([nroUnidadFuncional])), '')),
             nombre            = LEFT(LTRIM(RTRIM(CONVERT(VARCHAR(50), [Nombre del consorcio]))), 50),
@@ -348,7 +350,11 @@ WITH (
             departamento      = CASE
                                    WHEN NULLIF(LTRIM(RTRIM([departamento])), '') IS NULL THEN NULL
                                    ELSE SUBSTRING(LTRIM(RTRIM([departamento])),1,1)
-                                END
+                                END,
+            cbu_cvu_csv       = NULLIF(LTRIM(RTRIM(REPLACE(REPLACE([CVU/CBU], ' ', ''), '-', ''))), '')
+            --,rolCsv           = NULLIF(LTRIM(RTRIM([rol])), '')
+            --,fechaInicioCsv   = TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM([fechaInicio])), ''))
+            --,fechaFinCsv      = TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM([fechaFin])), ''))
         FROM #RawUF
         WHERE NULLIF(LTRIM(RTRIM([Nombre del consorcio])), '') IS NOT NULL
           AND TRY_CONVERT(INT, NULLIF(LTRIM(RTRIM([nroUnidadFuncional])), '')) IS NOT NULL;
@@ -375,7 +381,7 @@ WITH (
                  ) AS rn
           FROM #Stg
         )
-        SELECT idUnidadFuncional, nombre, piso, departamento
+        SELECT idUnidadFuncional, nombre, piso, departamento, cbu_cvu_csv /*,rolCsv,fechaInicioCsv,fechaFinCsv*/
         INTO #StgDedup
         FROM ranked
         WHERE rn = 1;
@@ -444,6 +450,55 @@ WITH (
         IF @maxUF IS NOT NULL
             DBCC CHECKIDENT ('app.Tbl_UnidadFuncional', RESEED, @maxUF) WITH NO_INFOMSGS;
 
+        /* 4c) NUEVO: relacionar UF con Persona por CBU/CVU e insertar en Tbl_UFPersona */
+;WITH personas AS (
+    SELECT
+        p.idPersona,
+        REPLACE(REPLACE(LTRIM(RTRIM(p.CBU_CVU)), ' ', ''), '-', '') AS cbu_norm
+    FROM app.Tbl_Persona p
+    WHERE p.CBU_CVU IS NOT NULL
+),
+stg AS (
+    SELECT
+        s.idUnidadFuncional,
+        s.nombre COLLATE Modern_Spanish_CI_AS AS nombre,
+        s.cbu_cvu_csv AS cbu_csv_norm,
+        s.piso, s.departamento
+    FROM #StgDedup s
+    WHERE s.cbu_cvu_csv IS NOT NULL
+),
+matchUF AS (
+    SELECT
+        u.idUnidadFuncional,
+        u.idConsorcio
+    FROM app.Tbl_UnidadFuncional u
+)
+INSERT INTO app.Tbl_UFPersona (idPersona, idUnidadFuncional, idConsorcio, esInquilino, fechaInicio, fechaFin)
+SELECT DISTINCT
+    per.idPersona,
+    s.idUnidadFuncional,
+    u.idConsorcio,
+    /* esInquilino */ NULL,
+    /* fechaInicio */ NULL,
+    /* fechaFin    */ NULL
+FROM stg s
+JOIN personas per
+  ON per.cbu_norm COLLATE Latin1_General_CI_AI = s.cbu_csv_norm COLLATE Latin1_General_CI_AI
+JOIN app.Tbl_Consorcio c
+  ON c.nombre COLLATE Modern_Spanish_CI_AS = s.nombre COLLATE Modern_Spanish_CI_AS
+JOIN matchUF u
+  ON u.idUnidadFuncional = s.idUnidadFuncional
+ AND u.idConsorcio = c.idConsorcio
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM app.Tbl_UFPersona up
+    WHERE up.idPersona = per.idPersona
+      AND up.idUnidadFuncional = s.idUnidadFuncional
+);
+
+
+        DECLARE @rowsUFPersona INT = @@ROWCOUNT;
+
         /* 5) Resultado */
         SELECT
             filas_csv            = (SELECT COUNT(*) FROM #RawUF),
@@ -453,7 +508,8 @@ WITH (
             consorcios_nuevos    = (SELECT COUNT(*) FROM @insCons),
             ufs_actualizadas     = @rowsUpd,
             ufs_insertadas       = @rowsIns,
-            mensaje              = N'OK: se aplicó todo (UPDATE existentes + INSERT nuevas). PB => piso 0';
+            ufpersonas_insertadas= @rowsUFPersona,
+            mensaje              = N'OK: Consorcios/UF listos y UFPersona insertado por CBU/CVU. PB => piso 0';
     END TRY
     BEGIN CATCH
         DECLARE @Err NVARCHAR(4000) = ERROR_MESSAGE();
@@ -466,8 +522,6 @@ EXEC importacion.Sp_CargarConsorcioYUF_DesdeCsv
     @RutaArchivo = N'C:\Users\PC\Desktop\consorcios\Inquilino-propietarios-UF.csv',
     @HDR = 1,
     @SoloPreview = 0;  -- inserta/actualiza
-
--- SELECT * FROM app.Tbl_UnidadFuncional;
 
 IF OBJECT_ID(N'importacion.Sp_CargarUFsDesdeTxt', N'P') IS NOT NULL
     DROP PROCEDURE importacion.Sp_CargarUFsDesdeTxt;
@@ -592,7 +646,8 @@ WITH (
             mensaje          = N'OK: cargado. PB→0, decimales con coma convertidos';
     END TRY
     BEGIN CATCH
-        
+        DECLARE @ErrMsg NVARCHAR(4000) = ERROR_MESSAGE();
+        RAISERROR(@ErrMsg, 16, 1);
     END CATCH
 END;
 GO
@@ -602,10 +657,6 @@ EXEC importacion.Sp_CargarUFsDesdeTxt
     @HDR           = 1,              -- 0 si NO hay encabezado
     @RowTerminator = N'0x0d0a',      -- probá N'0x0a' si no levanta
     @CodePage      = N'65001';       -- si ves acentos raros, probá N'ACP'
-
--- SELECT * FROM app.Tbl_Consorcio;
-
--- SELECT * FROM app.Tbl_UnidadFuncional;
 
 IF OBJECT_ID(N'importacion.Sp_CargarUFPersonaDesdeTxt', N'P') IS NOT NULL
     DROP PROCEDURE importacion.Sp_CargarUFPersonaDesdeTxt;
@@ -760,41 +811,41 @@ WITH (
             msg = N'OK: UFPersona cargada/actualizada (PB→0; admite SI/NO, 1/0, TRUE/FALSE).';
     END TRY
     BEGIN CATCH
-        
+        DECLARE @ErrMsg NVARCHAR(4000) = ERROR_MESSAGE();
+        RAISERROR(@ErrMsg, 16, 1);
     END CATCH
 END;
 GO
 
-IF OBJECT_ID(N'importacion.Sp_CargarPersonasDesdeCsvDatos', N'P') IS NOT NULL
-    DROP PROCEDURE importacion.Sp_CargarPersonasDesdeCsvDatos;
+IF OBJECT_ID(N'importacion.Sp_CargarUFInquilinosDesdeCsv', N'P') IS NOT NULL
+    DROP PROCEDURE importacion.Sp_CargarUFInquilinosDesdeCsv;
 GO
-
-CREATE PROCEDURE importacion.Sp_CargarPersonasDesdeCsvDatos
+CREATE PROCEDURE importacion.Sp_CargarUFInquilinosDesdeCsv
     @RutaArchivo    NVARCHAR(4000),            -- ej: N'C:\...\Inquilino-propietarios-datos.csv'
     @HDR            BIT = 1,                   -- 1 = primera fila encabezado
     @RowTerminator  NVARCHAR(10) = N'0x0d0a',  -- CRLF (usar '0x0a' si solo LF)
-    @CodePage       NVARCHAR(16) = N'ACP'      -- Latin1/Windows-1252; usar '65001' si UTF-8
+    @CodePage       NVARCHAR(16) = N'ACP',     -- latin1; usar '65001' si UTF-8
+    @SoloPreview    BIT = 1                    -- 1 = NO actualiza; 0 = actualiza
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    BEGIN TRY
-        /* 1) RAW: columnas como vienen (separador ';') */
-        IF OBJECT_ID('tempdb..#Raw','U') IS NOT NULL DROP TABLE #Raw;
-        CREATE TABLE #Raw
-        (
-            [Nombre]                 NVARCHAR(255) COLLATE Latin1_General_CI_AI NULL,
-            [apellido]               NVARCHAR(255) COLLATE Latin1_General_CI_AI NULL,
-            [DNI]                    NVARCHAR(50)  COLLATE Latin1_General_CI_AI NULL,
-            [email personal]         NVARCHAR(255) COLLATE Latin1_General_CI_AI NULL,
-            [telfono de contacto]   NVARCHAR(255) COLLATE Latin1_General_CI_AI NULL, -- viene así
-            [CVU/CBU]                NVARCHAR(64)  COLLATE Latin1_General_CI_AI NULL,
-            [Inquilino]              NVARCHAR(50)  COLLATE Latin1_General_CI_AI NULL   -- ignorado
-        );
+    DECLARE @FirstRow INT = CASE WHEN @HDR=1 THEN 2 ELSE 1 END;
 
-        DECLARE @FirstRow INT = CASE WHEN @HDR=1 THEN 2 ELSE 1 END;
+    -- 1) RAW tal cual del CSV (usa ';' y latin1 por defecto)
+    IF OBJECT_ID('tempdb..#Raw','U') IS NOT NULL DROP TABLE #Raw;
+    CREATE TABLE #Raw
+    (
+        [Nombre]                 NVARCHAR(255) COLLATE Latin1_General_CI_AI NULL,
+        [apellido]               NVARCHAR(255) COLLATE Latin1_General_CI_AI NULL,
+        [DNI]                    NVARCHAR(50)  COLLATE Latin1_General_CI_AI NULL,
+        [email personal]         NVARCHAR(255) COLLATE Latin1_General_CI_AI NULL,
+        [telfono de contacto]   NVARCHAR(255) COLLATE Latin1_General_CI_AI NULL, -- viene así
+        [CVU/CBU]                NVARCHAR(64)  COLLATE Latin1_General_CI_AI NULL,
+        [Inquilino]              NVARCHAR(50)  COLLATE Latin1_General_CI_AI NULL
+    );
 
-        DECLARE @sql NVARCHAR(MAX) = N'
+    DECLARE @sql NVARCHAR(MAX) = N'
 BULK INSERT #Raw
 FROM ' + QUOTENAME(@RutaArchivo,'''') + N'
 WITH (
@@ -805,131 +856,695 @@ WITH (
     KEEPNULLS,
     TABLOCK
 );';
-        EXEC (@sql);
+    EXEC (@sql);
 
-        /* 2) STAGING tipado/limpio */
-        IF OBJECT_ID('tempdb..#Stg','U') IS NOT NULL DROP TABLE #Stg;
-        CREATE TABLE #Stg
-        (
-            nombre     VARCHAR(50)  COLLATE Latin1_General_CI_AI NOT NULL,
-            apellido   VARCHAR(50)  COLLATE Latin1_General_CI_AI NOT NULL,
-            dni        INT          NOT NULL,
-            email      VARCHAR(100) COLLATE Latin1_General_CI_AI NULL,
-            telefono   VARCHAR(12)  COLLATE Latin1_General_CI_AI NULL,
-            cbu_cvu    CHAR(22)     COLLATE Latin1_General_CI_AI NULL
-        );
+    DECLARE @filasRaw INT = (SELECT COUNT(*) FROM #Raw);
+    RAISERROR(N'[CSV] Filas leídas: %d', 0, 1, @filasRaw) WITH NOWAIT;
 
-        ;WITH t AS
-        (
-            SELECT
-                nom   = LEFT(LTRIM(RTRIM(CONVERT(VARCHAR(50),  [Nombre]))), 50),
-                ape   = LEFT(LTRIM(RTRIM(CONVERT(VARCHAR(50),  [apellido]))), 50),
-                dni_s = LTRIM(RTRIM([DNI])),
-                mail  = LOWER(LTRIM(RTRIM(CONVERT(VARCHAR(100), [email personal])))),
-                tel_s = LTRIM(RTRIM([telfono de contacto])),
-                cbu_s = LTRIM(RTRIM([CVU/CBU]))
-            FROM #Raw
-        ),
-        tel AS
-        (
-            SELECT
-                nom, ape, dni_s, mail,
-                tel_clean = CASE WHEN tel_s IS NULL THEN NULL
-                                 ELSE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(tel_s,' ',''),'-',''),'(',''),')',''),'.','')
-                            END,
-                cbu_s
-            FROM t
-        ),
-        cbu AS
-        (
-            SELECT
-                nom, ape, dni_s, mail, tel_clean,
-                cbu_digits = CASE WHEN cbu_s IS NULL THEN NULL
-                                  ELSE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(cbu_s
-                                        ,' ',''),'-',''),'.',''),'/',''),'\',''),'_',''),'(',''),')',''),CHAR(9),''),CHAR(160),'')
-                             END
-            FROM tel
-        )
-        INSERT INTO #Stg (nombre, apellido, dni, email, telefono, cbu_cvu)
+    -- 2) STAGING: limpiar CBU/CBU → 22 dígitos y mapear Inquilino → BIT
+    IF OBJECT_ID('tempdb..#Stg','U') IS NOT NULL DROP TABLE #Stg;
+    CREATE TABLE #Stg
+    (
+        cbu_cvu     CHAR(22)    COLLATE Latin1_General_CI_AI NOT NULL,
+        esInquilino BIT         NOT NULL
+    );
+
+    ;WITH s AS
+    (
         SELECT
-            nom,
-            ape,
-            TRY_CONVERT(INT, NULLIF(dni_s,'')) AS dni,
-            NULLIF(mail,'') AS email,
-            CASE WHEN tel_clean IS NULL OR tel_clean = '' THEN NULL
-                 ELSE LEFT(tel_clean, 12) END AS telefono,
-            CASE WHEN cbu_digits IS NULL OR LEN(cbu_digits) <> 22 THEN NULL
-                 ELSE CONVERT(CHAR(22), cbu_digits) END AS cbu_cvu
-        FROM cbu
-        WHERE TRY_CONVERT(INT, NULLIF(dni_s,'')) IS NOT NULL
-          AND NULLIF(nom,'') IS NOT NULL
-          AND NULLIF(ape,'') IS NOT NULL;
+            cbu_digits = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                             LTRIM(RTRIM([CVU/CBU])),' ',''),'-',''),'.',''),'/',''),'\',''),'_',''),
+                             '(' ,''),')',''),CHAR(9),''),CHAR(160),''),
+            inq_raw    = LTRIM(RTRIM([Inquilino]))
+        FROM #Raw
+    )
+    INSERT INTO #Stg(cbu_cvu, esInquilino)
+    SELECT DISTINCT
+        CONVERT(CHAR(22), s.cbu_digits),
+        CASE 
+            WHEN LOWER(s.inq_raw) COLLATE Latin1_General_CI_AI IN (N'si',N'sí',N'true',N'1',N'inquilino') THEN 1
+            WHEN LOWER(s.inq_raw) COLLATE Latin1_General_CI_AI IN (N'no',N'false',N'0',N'propietario') THEN 0
+        END
+    FROM s
+    WHERE s.cbu_digits IS NOT NULL
+      AND s.cbu_digits NOT LIKE '%[^0-9]%'
+      AND LEN(s.cbu_digits)=22
+      AND inq_raw IS NOT NULL
+      AND LOWER(inq_raw) COLLATE Latin1_General_CI_AI IN (N'si',N'sí',N'true',N'1',N'inquilino', N'no',N'false',N'0',N'propietario');
 
-        /* 3) Normalizar emails duplicados (evitar violar UNIQUE) */
-        IF OBJECT_ID('tempdb..#Stg2','U') IS NOT NULL DROP TABLE #Stg2;
-        CREATE TABLE #Stg2
-        (
-            nombre     VARCHAR(50)  COLLATE Latin1_General_CI_AI NOT NULL,
-            apellido   VARCHAR(50)  COLLATE Latin1_General_CI_AI NOT NULL,
-            dni        INT          NOT NULL,
-            email      VARCHAR(100) COLLATE Latin1_General_CI_AI NULL,
-            telefono   VARCHAR(12)  COLLATE Latin1_General_CI_AI NULL,
-            cbu_cvu    CHAR(22)     COLLATE Latin1_General_CI_AI NULL
-        );
+    DECLARE @filasStg INT = (SELECT COUNT(*) FROM #Stg);
+    RAISERROR(N'[STG] Filas válidas (CBU 22 dígitos + Inquilino mapeado): %d', 0, 1, @filasStg) WITH NOWAIT;
 
-        INSERT INTO #Stg2 (nombre, apellido, dni, email, telefono, cbu_cvu)
-        SELECT s.nombre, s.apellido, s.dni,
-               CASE
-                    WHEN s.email IS NULL THEN NULL
-                    WHEN EXISTS (SELECT 1 FROM app.Tbl_Persona p WHERE p.email = s.email AND p.dni <> s.dni)
-                         THEN NULL
-                    ELSE s.email
-               END AS email,
-               s.telefono,
-               s.cbu_cvu
-        FROM #Stg s;
+    -- 2.a) Preview: ver lo que se leyó y cómo queda mapeado
+    SELECT TOP (20)
+        [CVU/CBU]          AS cbu_csv,
+        [Inquilino]        AS inquilino_csv,
+        CASE WHEN LOWER([Inquilino]) COLLATE Latin1_General_CI_AI IN (N'si',N'sí',N'true',N'1',N'inquilino') THEN 1
+             WHEN LOWER([Inquilino]) COLLATE Latin1_General_CI_AI IN (N'no',N'false',N'0',N'propietario') THEN 0
+        END                 AS esInquilino_mapeado
+    FROM #Raw;
 
-        /* 4) UPSERT por DNI */
-        -- UPDATE
-        UPDATE p
-           SET p.nombre   = s.nombre,
-               p.apellido = s.apellido,
-               p.dni      = s.dni,
-               p.email    = COALESCE(s.email, p.email),
-               p.telefono = COALESCE(s.telefono, p.telefono),
-               p.CBU_CVU  = COALESCE(s.cbu_cvu, p.CBU_CVU)
-        FROM app.Tbl_Persona p
-        JOIN #Stg2 s ON s.dni = p.dni;
+    -- 3) Resolver personas por CBU/CVU
+    IF OBJECT_ID('tempdb..#MatchPersona','U') IS NOT NULL DROP TABLE #MatchPersona;
+    CREATE TABLE #MatchPersona
+    (
+        idPersona INT NOT NULL,
+        cbu_cvu   CHAR(22) COLLATE Latin1_General_CI_AI NOT NULL,
+        esInquilino BIT NOT NULL
+    );
+
+    INSERT INTO #MatchPersona(idPersona, cbu_cvu, esInquilino)
+    SELECT p.idPersona, st.cbu_cvu, st.esInquilino
+    FROM #Stg st
+    JOIN app.Tbl_Persona p
+      ON p.CBU_CVU = st.cbu_cvu;
+
+    DECLARE @matchPersona INT = (SELECT COUNT(*) FROM #MatchPersona);
+    RAISERROR(N'[MATCH] Personas encontradas por CBU/CVU: %d', 0, 1, @matchPersona) WITH NOWAIT;
+
+    -- 3.a) CBUs que NO tienen persona (para saber por qué no actualiza)
+    SELECT TOP (20) st.cbu_cvu
+    FROM #Stg st
+    WHERE NOT EXISTS (SELECT 1 FROM app.Tbl_Persona p WHERE p.CBU_CVU = st.cbu_cvu);
+
+    -- 4) Resolver UF vinculadas a esas personas
+    IF OBJECT_ID('tempdb..#MatchUF','U') IS NOT NULL DROP TABLE #MatchUF;
+    CREATE TABLE #MatchUF
+    (
+        idPersona         INT NOT NULL,
+        idUnidadFuncional INT NOT NULL,
+        esInquilino       BIT NOT NULL
+    );
+
+    INSERT INTO #MatchUF(idPersona, idUnidadFuncional, esInquilino)
+    SELECT mp.idPersona, ufp.idUnidadFuncional, mp.esInquilino
+    FROM #MatchPersona mp
+    JOIN app.Tbl_UFPersona ufp
+      ON ufp.idPersona = mp.idPersona;
+
+    DECLARE @matchUF INT = (SELECT COUNT(*) FROM #MatchUF);
+    RAISERROR(N'[MATCH] Relaciones UFPersona encontradas para esas personas: %d', 0, 1, @matchUF) WITH NOWAIT;
+
+    -- 4.a) Personas con CBU que NO tienen filas en UFPersona (causa típica de 0 updates)
+    SELECT TOP (20) mp.idPersona, mp.cbu_cvu
+    FROM #MatchPersona mp
+    WHERE NOT EXISTS (
+        SELECT 1 FROM app.Tbl_UFPersona ufp WHERE ufp.idPersona = mp.idPersona
+    );
+
+    -- 5) UPDATE (opcional)
+    IF (@SoloPreview = 0)
+    BEGIN
+        UPDATE ufp
+           SET ufp.esInquilino = muf.esInquilino
+        FROM app.Tbl_UFPersona ufp
+        JOIN #MatchUF muf
+          ON muf.idPersona = ufp.idPersona
+         AND muf.idUnidadFuncional = ufp.idUnidadFuncional;
 
         DECLARE @rowsUpd INT = @@ROWCOUNT;
+        RAISERROR(N'[UPDATE] Filas actualizadas en Tbl_UFPersona: %d', 0, 1, @rowsUpd) WITH NOWAIT;
+    END
+    ELSE
+    BEGIN
+        RAISERROR(N'[PREVIEW] No se actualiza (usar @SoloPreview=0 para aplicar cambios).', 0, 1) WITH NOWAIT;
+        -- Preview de lo que se actualizaría
+        SELECT TOP (50)
+            ufp.idPersona, ufp.idUnidadFuncional,
+            ufp.esInquilino AS esInquilino_actual,
+            muf.esInquilino AS esInquilino_nuevo
+        FROM app.Tbl_UFPersona ufp
+        JOIN #MatchUF muf
+          ON muf.idPersona = ufp.idPersona
+         AND muf.idUnidadFuncional = ufp.idUnidadFuncional;
+    END
 
-        -- INSERT (los que no existen por DNI)
-        INSERT INTO app.Tbl_Persona (nombre, apellido, dni, email, telefono, CBU_CVU)
-        SELECT s.nombre, s.apellido, s.dni, s.email, s.telefono, s.cbu_cvu
-        FROM #Stg2 s
-        WHERE NOT EXISTS (SELECT 1 FROM app.Tbl_Persona p WHERE p.dni = s.dni);
-
-        DECLARE @rowsIns INT = @@ROWCOUNT;
-
-        /* 5) Resultado */
-        SELECT
-            filas_csv      = (SELECT COUNT(*) FROM #Raw),
-            filas_validas  = (SELECT COUNT(*) FROM #Stg2),
-            personas_upd   = @rowsUpd,
-            personas_ins   = @rowsIns,
-            msg            = N'OK: Personas cargadas por DNI (email único protegido, tel/CBU normalizados).';
-    END TRY
-    BEGIN CATCH
-        
-    END CATCH
+    -- 6) Resumen final
+    SELECT
+        filas_csv_total               = @filasRaw,
+        filas_validas_stg             = @filasStg,
+        personas_con_cbu              = @matchPersona,
+        uf_relaciones_encontradas     = @matchUF,
+        nota                          = CASE WHEN @SoloPreview=1 THEN 'Preview: no se actualiza'
+                                             ELSE 'Aplicado: esInquilino actualizado'
+                                        END;
 END;
 GO
 
-EXEC importacion.Sp_CargarPersonasDesdeCsvDatos
-    @RutaArchivo   = N'C:\Users\PC\Desktop\consorcios\Inquilino-propietarios-datos.csv',
-    @HDR           = 1,
-    @RowTerminator = N'0x0d0a',  -- si no levanta, probá N'0x0a'
-    @CodePage      = N'ACP';     -- si el archivo es UTF-8, poné N'65001'
+IF OBJECT_ID('dbo.fn_ParseImporteFlexible', 'FN') IS NOT NULL
+    DROP FUNCTION dbo.fn_ParseImporteFlexible;
+GO
+CREATE FUNCTION dbo.fn_ParseImporteFlexible (@s NVARCHAR(100))
+RETURNS DECIMAL(18,2)
+AS
+BEGIN
+    -- Normalización previa (quita NBSP, $, ARS, espacios, tabs)
+    DECLARE @t NVARCHAR(100) =
+        REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ISNULL(@s,N''), CHAR(160), ' '), 'ARS', ''), '$', ''), ' ', ''), CHAR(9), '');
 
--- SELECT * FROM app.Tbl_Persona;
+    -- Negativos tipo (123,45)
+    IF LEFT(@t,1)='(' AND RIGHT(@t,1)=')'
+        SET @t = '-' + SUBSTRING(@t,2,LEN(@t)-2);
 
+    DECLARE @res DECIMAL(18,2);
+
+    -- Estilo US: 120,000.00
+    SET @res = TRY_CONVERT(DECIMAL(18,2), REPLACE(@t, ',', ''));
+    IF @res IS NOT NULL RETURN @res;
+
+    -- Estilo EU: 33.706,04
+    SET @res = TRY_CONVERT(DECIMAL(18,2), REPLACE(REPLACE(@t, '.', ''), ',', '.'));
+    IF @res IS NOT NULL RETURN @res;
+
+    -- Fallback: dejar dígitos y . , -
+    DECLARE @u NVARCHAR(100) = N'';
+    DECLARE @i INT = 1, @c NCHAR(1);
+    WHILE @i <= LEN(@t)
+    BEGIN
+        SET @c = SUBSTRING(@t, @i, 1);
+        IF @c LIKE N'[0-9]' OR @c IN (N'.', N',', N'-')
+            SET @u = @u + @c;
+        SET @i += 1;
+    END
+
+    -- Elegir separador decimal: el último que aparezca (.,)
+    DECLARE @pDot INT = NULLIF(CHARINDEX('.', REVERSE(@u)), 0);
+    DECLARE @pCom INT = NULLIF(CHARINDEX(',', REVERSE(@u)), 0);
+    DECLARE @sep NCHAR(1) =
+        CASE WHEN @pDot IS NOT NULL AND (@pCom IS NULL OR @pDot < @pCom) THEN '.'
+             WHEN @pCom IS NOT NULL THEN ','
+             ELSE '.'
+        END;
+
+    IF @sep='.'
+        SET @u = REPLACE(@u, ',', '');
+    ELSE
+        SET @u = REPLACE(REPLACE(@u, '.', ''), ',', '.');
+
+    RETURN TRY_CONVERT(DECIMAL(18,2), @u);
+END
+GO
+
+ALTER PROCEDURE importacion.Sp_CargarGastosDesdeJson
+    @RutaArchivo NVARCHAR(4000),
+    @Anio INT,
+    @DiaVto1 TINYINT = 10,
+    @DiaVto2 TINYINT = 20
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    /* 1) Leer JSON */
+    DECLARE @json NVARCHAR(MAX);
+    DECLARE @sql NVARCHAR(MAX) = N'
+        SELECT @jsonOut = BulkColumn
+        FROM OPENROWSET (BULK ''' + REPLACE(@RutaArchivo, '''', '''''') + ''', SINGLE_CLOB) AS j
+    ';
+    EXEC sp_executesql @sql, N'@jsonOut NVARCHAR(MAX) OUTPUT', @jsonOut = @json OUTPUT;
+
+    IF @json IS NULL
+    BEGIN
+        RAISERROR('No se pudo leer el archivo JSON con OPENROWSET. Verificá ruta/permisos y que Ad Hoc Distributed Queries esté habilitado.', 16, 1);
+        RETURN;
+    END
+
+    /* 2) Staging */
+    IF OBJECT_ID('tempdb..#stg_gasto') IS NOT NULL DROP TABLE #stg_gasto;
+    CREATE TABLE #stg_gasto
+    (
+        consorcio   NVARCHAR(200) COLLATE DATABASE_DEFAULT NOT NULL,
+        mes_raw     NVARCHAR(50)  COLLATE DATABASE_DEFAULT NOT NULL,
+        mes         TINYINT       NULL,
+        categoria   NVARCHAR(100) COLLATE DATABASE_DEFAULT NOT NULL,
+        importe_raw NVARCHAR(100) COLLATE DATABASE_DEFAULT NULL,
+        importe     DECIMAL(18,2) NULL
+    );
+
+    ;WITH rows AS (
+        SELECT CAST([value] AS NVARCHAR(MAX)) AS obj
+        FROM OPENJSON(@json)
+    ),
+    base AS (
+        SELECT
+            JSON_VALUE(obj, '$."Nombre del consorcio"') AS consorcio,
+            JSON_VALUE(obj, '$."Mes"')                  AS mes_raw,
+            obj
+        FROM rows
+    ),
+    unpvt AS (
+        SELECT 
+            b.consorcio,
+            b.mes_raw,
+            v.categoria,
+            v.importe_raw
+        FROM base b
+        CROSS APPLY ( VALUES
+            (N'BANCARIOS',               JSON_VALUE(b.obj, '$."BANCARIOS"')),
+            (N'LIMPIEZA',                JSON_VALUE(b.obj, '$."LIMPIEZA"')),
+            (N'ADMINISTRACION',          JSON_VALUE(b.obj, '$."ADMINISTRACION"')),
+            (N'SEGUROS',                 JSON_VALUE(b.obj, '$."SEGUROS"')),
+            (N'GASTOS GENERALES',        JSON_VALUE(b.obj, '$."GASTOS GENERALES"')),
+            (N'SERVICIOS PUBLICOS-Agua', JSON_VALUE(b.obj, '$."SERVICIOS PUBLICOS-Agua"')),
+            (N'SERVICIOS PUBLICOS-Luz',  JSON_VALUE(b.obj, '$."SERVICIOS PUBLICOS-Luz"'))
+        ) AS v(categoria, importe_raw)
+    )
+    INSERT INTO #stg_gasto (consorcio, mes_raw, categoria, importe_raw, mes, importe)
+    SELECT
+        LTRIM(RTRIM(consorcio)) COLLATE DATABASE_DEFAULT,
+        LTRIM(RTRIM(mes_raw))   COLLATE DATABASE_DEFAULT,
+        v.categoria             COLLATE DATABASE_DEFAULT,
+        LTRIM(RTRIM(importe_raw)) COLLATE DATABASE_DEFAULT,
+        CASE 
+            WHEN LOWER(LTRIM(RTRIM(mes_raw))) IN (N'enero')      THEN 1
+            WHEN LOWER(LTRIM(RTRIM(mes_raw))) IN (N'febrero')    THEN 2
+            WHEN LOWER(LTRIM(RTRIM(mes_raw))) IN (N'marzo')      THEN 3
+            WHEN LOWER(LTRIM(RTRIM(mes_raw))) IN (N'abril')      THEN 4
+            WHEN LOWER(REPLACE(mes_raw,' ','')) LIKE N'mayo%'    THEN 5
+            WHEN LOWER(LTRIM(RTRIM(mes_raw))) IN (N'junio')      THEN 6
+            WHEN LOWER(LTRIM(RTRIM(mes_raw))) IN (N'julio')      THEN 7
+            WHEN LOWER(LTRIM(RTRIM(mes_raw))) IN (N'agosto')     THEN 8
+            WHEN LOWER(LTRIM(RTRIM(mes_raw))) IN (N'septiembre') THEN 9
+            WHEN LOWER(LTRIM(RTRIM(mes_raw))) IN (N'octubre')    THEN 10
+            WHEN LOWER(LTRIM(RTRIM(mes_raw))) IN (N'noviembre')  THEN 11
+            WHEN LOWER(LTRIM(RTRIM(mes_raw))) IN (N'diciembre')  THEN 12
+        END,
+        CASE 
+            WHEN importe_raw IS NULL OR importe_raw = N'' THEN NULL
+            ELSE dbo.fn_ParseImporteFlexible(importe_raw)
+        END
+    FROM unpvt v
+    WHERE NULLIF(LTRIM(RTRIM(consorcio)), N'') IS NOT NULL;
+
+    /* Avisos */
+    DECLARE @filasDescartadas INT;
+    ;WITH rows2 AS (SELECT CAST([value] AS NVARCHAR(MAX)) AS obj FROM OPENJSON(@json))
+    SELECT @filasDescartadas = COUNT(1)
+    FROM rows2
+    WHERE NULLIF(LTRIM(RTRIM(JSON_VALUE(obj, '$."Nombre del consorcio"'))), N'') IS NULL;
+    IF @filasDescartadas > 0
+        PRINT CONCAT('Advertencia: ', @filasDescartadas, ' filas descartadas por consorcio NULL o vacío.');
+    IF EXISTS (SELECT 1 FROM #stg_gasto WHERE importe_raw IS NOT NULL AND importe IS NULL)
+        PRINT 'Advertencia: hay importes que no se pudieron convertir. Revisar #stg_gasto.';
+
+    /* 4) Mapa extraordinario (editable) */
+    IF OBJECT_ID('tempdb..#map_extra') IS NOT NULL DROP TABLE #map_extra;
+    CREATE TABLE #map_extra (categoria NVARCHAR(100) COLLATE DATABASE_DEFAULT PRIMARY KEY);
+    -- INSERT INTO #map_extra(categoria) VALUES (N'GASTOS GENERALES');
+
+    /* 5) Consorcios */
+    ;WITH cte_cons AS (
+        SELECT DISTINCT consorcio FROM #stg_gasto
+        WHERE consorcio IS NOT NULL AND consorcio <> N''
+    )
+    INSERT INTO app.Tbl_Consorcio (nombre, direccion, superficieTotal)
+    SELECT c.consorcio, NULL, NULL
+    FROM cte_cons c
+    LEFT JOIN app.Tbl_Consorcio tc ON tc.nombre = c.consorcio COLLATE DATABASE_DEFAULT
+    WHERE tc.idConsorcio IS NULL;
+
+    IF OBJECT_ID('tempdb..#cons') IS NOT NULL DROP TABLE #cons;
+    SELECT c.consorcio, tc.idConsorcio
+    INTO #cons
+    FROM (SELECT DISTINCT consorcio FROM #stg_gasto) c
+    INNER JOIN app.Tbl_Consorcio tc ON tc.nombre = c.consorcio COLLATE DATABASE_DEFAULT;
+
+    /* 6) Expensas */
+    IF OBJECT_ID('tempdb..#exp_sum') IS NOT NULL DROP TABLE #exp_sum;
+    SELECT cn.idConsorcio, s.mes, SUM(s.importe) AS total
+    INTO #exp_sum
+    FROM #stg_gasto s
+    INNER JOIN #cons cn ON cn.consorcio = s.consorcio COLLATE DATABASE_DEFAULT
+    WHERE s.importe IS NOT NULL AND s.mes BETWEEN 1 AND 12
+    GROUP BY cn.idConsorcio, s.mes;
+
+    IF OBJECT_ID('tempdb..#exp') IS NOT NULL DROP TABLE #exp;
+    CREATE TABLE #exp (idConsorcio INT, mes TINYINT, nroExpensa INT);
+
+    DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
+        SELECT idConsorcio, mes, total FROM #exp_sum;
+    DECLARE @idC INT, @mes TINYINT, @total DECIMAL(18,2);
+    OPEN cur;
+    FETCH NEXT FROM cur INTO @idC, @mes, @total;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        DECLARE @fechaGen DATE = DATEFROMPARTS(@Anio, @mes, 1);
+        DECLARE @finMes  DATE = EOMONTH(@fechaGen);
+        DECLARE @v1 DATE = IIF(@DiaVto1 IS NULL, @finMes, DATEFROMPARTS(@Anio, @mes, IIF(@DiaVto1 > DAY(@finMes), DAY(@finMes), @DiaVto1)));
+        DECLARE @v2 DATE = IIF(@DiaVto2 IS NULL, @finMes, DATEFROMPARTS(@Anio, @mes, IIF(@DiaVto2 > DAY(@finMes), DAY(@finMes), @DiaVto2)));
+
+        DECLARE @nroExp INT;
+
+        SELECT @nroExp = e.nroExpensa
+        FROM app.Tbl_Expensa e
+        WHERE e.idConsorcio = @idC AND e.fechaGeneracion = @fechaGen;
+
+        IF @nroExp IS NULL
+        BEGIN
+            INSERT INTO app.Tbl_Expensa (idConsorcio, fechaGeneracion, fechaVto1, fechaVto2, montoTotal)
+            VALUES (@idC, @fechaGen, @v1, @v2, @total);
+            SET @nroExp = SCOPE_IDENTITY();
+        END
+        ELSE
+        BEGIN
+            UPDATE app.Tbl_Expensa
+               SET montoTotal = @total,
+                   fechaVto1  = @v1,
+                   fechaVto2  = @v2
+             WHERE nroExpensa = @nroExp;
+        END
+
+        INSERT INTO #exp(idConsorcio, mes, nroExpensa) VALUES (@idC, @mes, @nroExp);
+        FETCH NEXT FROM cur INTO @idC, @mes, @total;
+    END
+    CLOSE cur; DEALLOCATE cur;
+
+    /* 7) Insertar Gastos + salida para subtablas (MERGE) */
+    IF OBJECT_ID('tempdb..#ins') IS NOT NULL DROP TABLE #ins;
+    CREATE TABLE #ins (
+        idGasto   INT NOT NULL,
+        categoria NVARCHAR(100) COLLATE DATABASE_DEFAULT NOT NULL
+    );
+
+    MERGE app.Tbl_Gasto AS tgt
+    USING (
+        SELECT 
+            e.nroExpensa                                    AS nroExpensa,
+            c.idConsorcio                                   AS idConsorcio,
+            CASE WHEN mx.categoria IS NOT NULL 
+                 THEN 'Extraordinario' ELSE 'Ordinario' END AS tipo,
+            -- Descripción exacta desde JSON: la categoría, sin "(mes año)"
+            s.categoria COLLATE DATABASE_DEFAULT            AS descripcion,
+            DATEFROMPARTS(@Anio, s.mes, 1)                  AS fechaEmision,
+            s.importe                                       AS importe,
+            s.categoria COLLATE DATABASE_DEFAULT            AS categoria
+        FROM #stg_gasto s
+        INNER JOIN #cons c  ON c.consorcio = s.consorcio COLLATE DATABASE_DEFAULT
+        INNER JOIN #exp e   ON e.idConsorcio = c.idConsorcio AND e.mes = s.mes
+        LEFT  JOIN #map_extra mx ON mx.categoria = s.categoria COLLATE DATABASE_DEFAULT
+        WHERE s.importe IS NOT NULL AND s.mes BETWEEN 1 AND 12
+    ) AS src
+    ON 1 = 0
+    WHEN NOT MATCHED THEN
+        INSERT (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
+        VALUES (src.nroExpensa, src.idConsorcio, src.tipo, src.descripcion, src.fechaEmision, src.importe)
+    OUTPUT INSERTED.idGasto, src.categoria INTO #ins(idGasto, categoria);
+
+    /* 8) Subtablas */
+    INSERT INTO app.Tbl_Gasto_Ordinario (idGasto, nombreProveedor, categoria, nroFactura)
+    SELECT i.idGasto, NULL, i.categoria, NULL
+    FROM #ins i
+    LEFT JOIN #map_extra mx ON mx.categoria = i.categoria COLLATE DATABASE_DEFAULT
+    WHERE mx.categoria IS NULL;
+
+    INSERT INTO app.Tbl_Gasto_Extraordinario (idGasto, cuotaActual, cantCuotas)
+    SELECT i.idGasto, 1, 1
+    FROM #ins i
+    INNER JOIN #map_extra mx ON mx.categoria = i.categoria COLLATE DATABASE_DEFAULT;
+
+    PRINT 'Proceso finalizado OK (importes corregidos y descripción sin "mes año").';
+END
+GO
+
+EXEC importacion.Sp_CargarGastosDesdeJson
+     @RutaArchivo = N'C:\Users\PC\Desktop\consorcios\Servicios.Servicios.json',  -- <- tu ruta local
+     @Anio        = 2025,
+     @DiaVto1     = 10,
+     @DiaVto2     = 20;
+
+---------------------------------------------------------
+
+IF OBJECT_ID(N'importacion.Sp_CargarPagosDesdeCsv', N'P') IS NOT NULL
+    DROP PROCEDURE importacion.Sp_CargarPagosDesdeCsv;
+GO
+
+CREATE PROCEDURE importacion.Sp_CargarPagosDesdeCsv
+    @RutaArchivo      NVARCHAR(4000),      -- Ej: N'C:\Data\pagos_consorcios.csv'
+    @HDR              BIT = 1,             -- 1 = primera fila encabezado; 0 = no
+    @Separador        CHAR(1) = ',',       -- separador de campos
+    @MostrarErrores   BIT = 0              -- 0 = no muestra; 1 = muestra (sin "motivo")
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Limpieza previa
+    IF OBJECT_ID('tempdb..#raw')                IS NOT NULL DROP TABLE #raw;
+    IF OBJECT_ID('tempdb..#norm')               IS NOT NULL DROP TABLE #norm;
+    IF OBJECT_ID('tempdb..#pagos')              IS NOT NULL DROP TABLE #pagos;
+    IF OBJECT_ID('tempdb..#errores')            IS NOT NULL DROP TABLE #errores;
+    IF OBJECT_ID('tempdb..#pagos_completos')    IS NOT NULL DROP TABLE #pagos_completos;
+
+    -- Raw ancho (acepta 3, 4 o más columnas)
+    CREATE TABLE #raw (
+        c1 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+        c2 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+        c3 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+        c4 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+        c5 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+        c6 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL
+    );
+
+    -- Mapeo flexible a 4 campos lógicos (id opcional)
+    CREATE TABLE #norm (
+        id_pago_txt NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+        fecha_txt   NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+        cbu_txt     NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+        valor_txt   NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL
+    );
+
+    CREATE TABLE #pagos (
+        fecha       DATE          NOT NULL,
+        CBU_CVU     VARCHAR(22)   COLLATE DATABASE_DEFAULT NOT NULL,
+        valor       DECIMAL(10,2) NOT NULL
+    );
+
+    -- Se usa internamente; no se devuelve salvo que @MostrarErrores=1
+    CREATE TABLE #errores (
+        motivo      NVARCHAR(200)  COLLATE DATABASE_DEFAULT,
+        fecha_txt   NVARCHAR(4000) COLLATE DATABASE_DEFAULT,
+        cbu_txt     NVARCHAR(4000) COLLATE DATABASE_DEFAULT,
+        valor_txt   NVARCHAR(4000) COLLATE DATABASE_DEFAULT
+    );
+
+    -- BULK INSERT
+    DECLARE @firstrow INT = CASE WHEN @HDR = 1 THEN 2 ELSE 1 END;
+
+    DECLARE @sql NVARCHAR(MAX) = N'
+BULK INSERT #raw
+FROM ' + QUOTENAME(@RutaArchivo,'''') + N'
+WITH (
+    FIRSTROW = ' + CAST(@firstrow AS NVARCHAR(10)) + N',
+    FIELDTERMINATOR = ' + QUOTENAME(@Separador,'''') + N',
+    ROWTERMINATOR = ''0x0a'',
+    CODEPAGE = ''65001'',
+    TABLOCK
+);';
+
+    BEGIN TRY
+        EXEC sp_executesql @sql;
+    END TRY
+    BEGIN CATCH
+        DECLARE @msg NVARCHAR(4000) = ERROR_MESSAGE();
+        RAISERROR(N'Error al leer el CSV con BULK INSERT: %s. Verifique permisos/visibilidad de la ruta para el servicio de SQL Server.', 16, 1, @msg);
+        RETURN;
+    END CATCH;
+
+    /* ===== 1) Normalización flexible de columnas ===== */
+    INSERT INTO #norm (id_pago_txt, fecha_txt, cbu_txt, valor_txt)
+    SELECT
+        CASE WHEN NULLIF(LTRIM(RTRIM(c4)),'') IS NOT NULL THEN c1 ELSE NULL END,
+        CASE WHEN NULLIF(LTRIM(RTRIM(c4)),'') IS NOT NULL THEN c2 ELSE c1 END,
+        CASE WHEN NULLIF(LTRIM(RTRIM(c4)),'') IS NOT NULL THEN c3 ELSE c2 END,
+        CASE WHEN NULLIF(LTRIM(RTRIM(c4)),'') IS NOT NULL THEN c4 ELSE c3 END
+    FROM #raw;
+
+    /* ===== 2) Parseo robusto de fecha y valor ===== */
+    ;WITH pre AS (
+        SELECT
+            fecha_txt,
+            cbu_txt,
+            valor_txt,
+            LTRIM(RTRIM(
+                REPLACE(REPLACE(REPLACE(valor_txt, NCHAR(160), N' '), CHAR(9), N' '), N'$', N'')
+            )) AS v0
+        FROM #norm
+    ),
+    norm_val AS (
+        SELECT
+            fecha_txt,
+            cbu_txt,
+            valor_txt,
+            REPLACE(REPLACE(v0, N'.', N''), N',', N'.') AS v1
+        FROM pre
+    ),
+    recorte AS (
+        SELECT
+            fecha_txt,
+            cbu_txt,
+            valor_txt,
+            CASE WHEN CHARINDEX(' ', v1) > 0 THEN LEFT(v1, CHARINDEX(' ', v1)-1) ELSE v1 END AS v_num_txt
+        FROM norm_val
+    ),
+    parsed AS (
+        SELECT
+            COALESCE(
+               TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(fecha_txt)),''), 103),
+               TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(fecha_txt)),''), 120),
+               TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(fecha_txt)),''))) AS fecha,
+            LEFT(LTRIM(RTRIM(cbu_txt)), 22) AS CBU_CVU,
+            TRY_CONVERT(decimal(10,2), v_num_txt) AS valor
+        FROM recorte
+    )
+    INSERT INTO #pagos (fecha, CBU_CVU, valor)
+    SELECT fecha, CBU_CVU, valor
+    FROM parsed
+    WHERE fecha IS NOT NULL
+      AND valor IS NOT NULL
+      AND NULLIF(CBU_CVU,'') IS NOT NULL;
+
+    /* ===== 2b) Errores de parseo (internos; no se devuelven por defecto) ===== */
+    INSERT INTO #errores (motivo, fecha_txt, cbu_txt, valor_txt)
+    SELECT
+        N'Fila inválida (fecha/valor/CBU)',
+        n.fecha_txt,
+        n.cbu_txt,
+        n.valor_txt
+    FROM #norm n
+    CROSS APPLY (SELECT LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(n.valor_txt, NCHAR(160), N' '), CHAR(9), N' '), N'$', N''))) AS v0) a
+    CROSS APPLY (SELECT REPLACE(REPLACE(a.v0, N'.', N''), N',', N'.') AS v1) b
+    CROSS APPLY (SELECT CASE WHEN CHARINDEX(' ', b.v1) > 0 THEN LEFT(b.v1, CHARINDEX(' ', b.v1)-1) ELSE b.v1 END AS v_num_txt) c
+    WHERE
+        COALESCE(
+           TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(n.fecha_txt)),''), 103),
+           TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(n.fecha_txt)),''), 120),
+           TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(n.fecha_txt)),''))) IS NULL
+        OR TRY_CONVERT(decimal(10,2), c.v_num_txt) IS NULL
+        OR NULLIF(LTRIM(RTRIM(n.cbu_txt)),'') IS NULL;
+
+    /* ===== 3) Resolver claves y completar pagos ===== */
+    ;WITH pagos_enriq AS (
+        SELECT
+            p.fecha,
+            p.CBU_CVU,
+            p.valor,
+            per.idPersona,
+            ufper.idUnidadFuncional AS nroUnidadFuncional,
+            ufper.idConsorcio
+        FROM #pagos p
+        LEFT JOIN app.Tbl_Persona   per   ON per.CBU_CVU       = p.CBU_CVU
+        LEFT JOIN app.Tbl_UFPersona ufper ON ufper.idPersona   = per.idPersona
+    )
+    SELECT
+        pe.*,
+        (SELECT TOP (1) e.nroExpensa
+           FROM app.Tbl_Expensa e
+          WHERE e.idConsorcio = pe.idConsorcio
+          ORDER BY e.fechaGeneracion DESC, e.nroExpensa DESC) AS nroExpensa
+    INTO #pagos_completos
+    FROM pagos_enriq pe;
+
+    -- Faltantes (interno)
+    INSERT INTO #errores (motivo, fecha_txt, cbu_txt, valor_txt)
+    SELECT
+        CASE 
+          WHEN idPersona IS NULL THEN N'CBU no existe en Tbl_Persona'
+          WHEN nroUnidadFuncional IS NULL THEN N'Persona sin relación UF (Tbl_UFPersona)'
+          WHEN idConsorcio IS NULL THEN N'No se determinó Consorcio'
+          WHEN nroExpensa IS NULL THEN N'No hay expensa para el consorcio'
+        END,
+        CONVERT(NVARCHAR(30), fecha, 121),
+        CBU_CVU, CONVERT(NVARCHAR(40), valor)
+    FROM #pagos_completos
+    WHERE idPersona IS NULL
+       OR nroUnidadFuncional IS NULL
+       OR idConsorcio IS NULL
+       OR nroExpensa IS NULL;
+
+    /* ===== 4) Crear EstadoCuenta (si falta) e insertar Pagos ===== */
+    ;WITH base_ok AS (
+        SELECT DISTINCT
+            pc.nroUnidadFuncional,
+            pc.idConsorcio,
+            pc.nroExpensa,
+            MIN(pc.fecha) OVER (PARTITION BY pc.nroUnidadFuncional, pc.idConsorcio, pc.nroExpensa) AS fecha_min
+        FROM #pagos_completos pc
+        WHERE pc.idPersona IS NOT NULL
+          AND pc.nroUnidadFuncional IS NOT NULL
+          AND pc.idConsorcio IS NOT NULL
+          AND pc.nroExpensa IS NOT NULL
+    )
+    INSERT INTO app.Tbl_EstadoCuenta
+        (nroUnidadFuncional, idConsorcio, nroExpensa,
+         saldoAnterior, pagoRecibido, deuda, interesMora,
+         expensasOrdinarias, expensasExtraordinarias, totalAPagar, fecha)
+    SELECT
+        b.nroUnidadFuncional, b.idConsorcio, b.nroExpensa,
+        0, 0, 0, 0, 0, 0, 0, b.fecha_min
+    FROM base_ok b
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM app.Tbl_EstadoCuenta ec
+        WHERE ec.nroUnidadFuncional = b.nroUnidadFuncional
+          AND ec.idConsorcio      = b.idConsorcio
+          AND ec.nroExpensa       = b.nroExpensa
+    );
+
+    INSERT INTO app.Tbl_Pago
+        (idEstadoCuenta, nroUnidadFuncional, idConsorcio, nroExpensa,
+         fecha, monto, CBU_CVU)
+    SELECT
+        ec.idEstadoCuenta,
+        pc.nroUnidadFuncional,
+        pc.idConsorcio,
+        pc.nroExpensa,
+        pc.fecha,
+        pc.valor,
+        pc.CBU_CVU
+    FROM #pagos_completos pc
+    INNER JOIN app.Tbl_EstadoCuenta ec
+      ON ec.nroUnidadFuncional = pc.nroUnidadFuncional
+     AND ec.idConsorcio       = pc.idConsorcio
+     AND ec.nroExpensa        = pc.nroExpensa;
+
+    -- Resultado: solo cantidad de pagos insertados
+    DECLARE @insertados INT = @@ROWCOUNT;
+    SELECT @insertados AS pagos_insertados;
+
+    -- Solo si lo pedís explícitamente, muestro las filas problemáticas (sin "motivo")
+    IF @MostrarErrores = 1 AND EXISTS (SELECT 1 FROM #errores)
+    BEGIN
+        SELECT fecha_txt, cbu_txt, valor_txt
+        FROM #errores;
+    END
+END
+GO
+
+EXEC importacion.Sp_CargarPagosDesdeCsv
+     @RutaArchivo = N'C:\Users\PC\Desktop\consorcios\pagos_consorcios.csv',
+     @HDR = 1,
+     @Separador = ',';
+
+	 /** idGasto INT NOT NULL IDENTITY(1,1) PRIMARY KEY,
+    nroExpensa INT NOT NULL,
+    idConsorcio INT NOT NULL,
+    tipo VARCHAR(16) CHECK (tipo IN ('Ordinario','Extraordinario')),
+    descripcion VARCHAR(200),
+    fechaEmision DATE,
+    importe DECIMAL(10,2), **/
+
+/** INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
+VALUES 
+(1, 1, 'Extraordinario', 'Reparación integral de fachada y balcones', CONVERT(date,'01/11/2025',103), 145000),
+(2, 2, 'Extraordinario', 'Renovación total del sistema eléctrico del edificio', CONVERT(date,'06/07/2025',103), 230000),
+(3, 3, 'Extraordinario', 'Instalación de sistema contra incendios', CONVERT(date,'22/04/2025',103), 100000),
+(4, 4, 'Extraordinario', 'Impermeabilización y refacción del techo del edificio', CONVERT(date,'30/12/2025',103), 500000),
+(5, 5, 'Extraordinario', 'Ampliación del área común y terminaciones completas en cerámico y luminarias', CONVERT(date,'19/08/2025',103), 210000);
+GO
+
+INSERT INTO app.Tbl_Gasto_Extraordinario (idGasto, cuotaActual, cantCuotas)
+VALUES 
+(1, 2, 7),
+(2, 2, 5),
+(3, 1, 2),
+(4, 1, 1),
+(5, 5, 6);
+GO **/
