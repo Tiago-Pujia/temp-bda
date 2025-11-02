@@ -931,4 +931,5 @@ EXEC importacion.Sp_CargarPersonasDesdeCsvDatos
     @RowTerminator = N'0x0d0a',  -- si no levanta, probá N'0x0a'
     @CodePage      = N'ACP';     -- si el archivo es UTF-8, poné N'65001'
 
-SELECT * FROM app.Tbl_Persona;
+-- SELECT * FROM app.Tbl_Persona;
+
