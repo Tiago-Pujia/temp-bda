@@ -39,15 +39,15 @@ GO
 -- ////////////////////////////////////////////////////////////////
 -- Permisos administrativo_general
 
--- ActualizaciÛn de datos de UF (SÕ)
+-- Actualizaci√≥n de datos de UF (S√ç)
 GRANT EXECUTE ON [importacion].[Sp_CargarConsorcioYUF_DesdeCsv] TO [administrativo_general];
 GRANT EXECUTE ON [importacion].[Sp_CargarUFsDesdeTxt] TO [administrativo_general];
 GRANT EXECUTE ON [importacion].[Sp_CargarUFInquilinosDesdeCsv] TO [administrativo_general];
 
--- ImportaciÛn de informaciÛn bancaria (NO)
+-- Importaci√≥n de informaci√≥n bancaria (NO)
 DENY EXECUTE ON [importacion].[Sp_CargarPagosDesdeCsv] TO [administrativo_general];
 
--- GeneraciÛn de reportes (SÕ)
+-- Generaci√≥n de reportes (S√ç)
 GRANT SELECT ON SCHEMA::[app] TO [administrativo_general];
 GRANT EXECUTE ON SCHEMA::[reportes] TO [administrativo_general];
 
@@ -59,19 +59,19 @@ GO
 -- ////////////////////////////////////////////////////////////////
 -- Permisos administrativo_bancario
 
--- ActualizaciÛn de datos de UF (NO)
+-- Actualizaci√≥n de datos de UF (NO)
 DENY EXECUTE ON [importacion].[Sp_CargarConsorcioYUF_DesdeCsv] TO [administrativo_bancario];
 DENY EXECUTE ON [importacion].[Sp_CargarUFsDesdeTxt] TO [administrativo_bancario];
 DENY EXECUTE ON [importacion].[Sp_CargarUFInquilinosDesdeCsv] TO [administrativo_bancario];
 
--- ImportaciÛn de informaciÛn bancaria (SÕ)
+-- Importaci√≥n de informaci√≥n bancaria (S√ç)
 GRANT EXECUTE ON [importacion].[Sp_CargarPagosDesdeCsv] TO [administrativo_bancario];
 
--- GeneraciÛn de reportes (SÕ)
+-- Generaci√≥n de reportes (S√ç)
 GRANT SELECT ON SCHEMA::[app] TO [administrativo_bancario];
 GRANT EXECUTE ON SCHEMA::[reportes] TO [administrativo_bancario];
 
--- DENEGAR acceso a modificaciÛn de datos
+-- DENEGAR acceso a modificaci√≥n de datos
 DENY INSERT, UPDATE, DELETE ON SCHEMA::[app] TO [administrativo_bancario];
 DENY ALTER ON DATABASE::[Com5600G13] TO [administrativo_bancario];
 GO
@@ -79,15 +79,15 @@ GO
 -- ////////////////////////////////////////////////////////////////
 -- Permisos administrativo_operativo
 
--- ActualizaciÛn de datos de UF (SÕ)
+-- Actualizaci√≥n de datos de UF (S√ç)
 GRANT EXECUTE ON [importacion].[Sp_CargarConsorcioYUF_DesdeCsv] TO [administrativo_operativo];
 GRANT EXECUTE ON [importacion].[Sp_CargarUFsDesdeTxt] TO [administrativo_operativo];
 GRANT EXECUTE ON [importacion].[Sp_CargarUFInquilinosDesdeCsv] TO [administrativo_operativo];
 
--- ImportaciÛn de informaciÛn bancaria (NO)
+-- Importaci√≥n de informaci√≥n bancaria (NO)
 DENY EXECUTE ON [importacion].[Sp_CargarPagosDesdeCsv] TO [administrativo_operativo];
 
--- GeneraciÛn de reportes (SÕ)
+-- Generaci√≥n de reportes (S√ç)
 GRANT SELECT ON SCHEMA::[app] TO [administrativo_operativo];
 GRANT EXECUTE ON SCHEMA::[reportes] TO [administrativo_operativo];
 
@@ -99,27 +99,27 @@ GO
 -- ////////////////////////////////////////////////////////////////
 -- Permisos sistemas
 
--- ActualizaciÛn de datos de UF (NO)
+-- Actualizaci√≥n de datos de UF (NO)
 DENY EXECUTE ON [importacion].[Sp_CargarConsorcioYUF_DesdeCsv] TO [sistemas];
 DENY EXECUTE ON [importacion].[Sp_CargarUFsDesdeTxt] TO [sistemas];
 DENY EXECUTE ON [importacion].[Sp_CargarUFInquilinosDesdeCsv] TO [sistemas];
 
--- ImportaciÛn de informaciÛn bancaria (NO)
+-- Importaci√≥n de informaci√≥n bancaria (NO)
 DENY EXECUTE ON [importacion].[Sp_CargarPagosDesdeCsv] TO [sistemas];
 
--- GeneraciÛn de reportes (SÕ)
+-- Generaci√≥n de reportes (S√ç)
 GRANT SELECT ON SCHEMA::[app] TO [sistemas];
 GRANT SELECT ON SCHEMA::[importacion] TO [sistemas];
 GRANT SELECT ON SCHEMA::[reportes] TO [sistemas];
 GRANT EXECUTE ON SCHEMA::[reportes] TO [sistemas];
 
--- DENEGAR cualquier modificaciÛn
+-- DENEGAR cualquier modificaci√≥n
 DENY INSERT, UPDATE, DELETE, ALTER ON SCHEMA::[app] TO [sistemas];
 DENY INSERT, UPDATE, DELETE, ALTER ON SCHEMA::[importacion] TO [sistemas];
 GO
 
 -- ////////////////////////////////////////////////////////////////
--- CreaciÛn usuarios
+-- Creaci√≥n usuarios
 
 -- Crear usuarios (sin login)
 IF NOT EXISTS (SELECT * FROM sys.database_principals WHERE name = 'usr_admin_general')

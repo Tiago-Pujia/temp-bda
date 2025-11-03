@@ -17,6 +17,8 @@ EXEC importacion.Sp_CargarGastosDesdeExcel
     @Verbose           = 1;
 GO
 
+SELECT * FROM app.Tbl_Gasto_Ordinario;
+
 EXEC importacion.Sp_CargarConsorcioYUF_DesdeCsv
     @RutaArchivo = N'C:\Users\PC\Desktop\consorcios\Inquilino-propietarios-UF.csv',
     @HDR         = 1,

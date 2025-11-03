@@ -10,23 +10,9 @@ EXEC dbo.sp_MSset_oledb_prop N'Microsoft.ACE.OLEDB.16.0', N'AllowInProcess', 1;
 EXEC dbo.sp_MSset_oledb_prop N'Microsoft.ACE.OLEDB.16.0', N'DynamicParameters', 1;
 
 USE Com5600G13;
-
-IF OBJECT_ID(N'reportes.logsReportes', N'U') IS NULL
-BEGIN
-    CREATE TABLE reportes.logsReportes
-    (
-        idLog INT IDENTITY(1,1) PRIMARY KEY,
-        fecha DATETIME2(3) NOT NULL CONSTRAINT DF_logsReportes_fecha DEFAULT SYSUTCDATETIME(),
-        procedimiento SYSNAME NULL,
-        tipo VARCHAR(30) NOT NULL, -- INFO | WARN | ERROR
-        mensaje NVARCHAR(4000) NULL,
-        detalle NVARCHAR(4000) NULL,
-        rutaArchivo NVARCHAR(4000) NULL, -- archivo origen (ej. Excel/CSV)
-        rutaLog NVARCHAR(4000) NULL -- path del archivo de log de texto
-    );
-END
 GO
 
+-- //////////////////////////////////////////////////////////////////////
 CREATE OR ALTER PROCEDURE reportes.Sp_LogReporte
     @Procedimiento SYSNAME,
     @Tipo          VARCHAR(30),            -- INFO | WARN | ERROR
@@ -76,7 +62,6 @@ BEGIN
     END
 END
 GO
-
 -- //////////////////////////////////////////////////////////////////////
 CREATE OR ALTER PROCEDURE importacion.Sp_CargarConsorciosDesdeExcel
     @RutaArchivo NVARCHAR(4000),                 -- (xlsx/xls) OBLIGATORIO
@@ -919,8 +904,13 @@ BEGIN
             n.dni_norm,
             CASE WHEN n.nom_norm  IS NULL THEN NULL ELSE LEFT(n.nom_norm ,100) END,
             CASE WHEN n.ape_norm  IS NULL THEN NULL ELSE LEFT(n.ape_norm ,100) END,
-            CASE WHEN n.mail_norm IS NULL THEN NULL ELSE LEFT(n.mail_norm,255) END,
-            CASE WHEN n.tel_norm  IS NULL THEN NULL ELSE LEFT(n.tel_norm ,50)  END
+			CASE
+                WHEN n.mail_norm IS NULL THEN NULL
+                WHEN importacion.fn_EmailValido(n.mail_norm) = 1
+                     THEN LEFT(n.mail_norm, 255)
+                ELSE NULL
+            END,
+			CASE WHEN n.tel_norm  IS NULL THEN NULL ELSE LEFT(n.tel_norm ,50)  END
         FROM n
         WHERE n.cbu_norm IS NOT NULL
           AND LEN(n.cbu_norm)=22
@@ -1001,64 +991,52 @@ BEGIN
                  @RutaLog       = @LogPath;
         END
 
-        /* 4) VINCULAR con UF por el MISMO CBU_CVU y upsert en UFPersona */
-        IF OBJECT_ID('tempdb..#MatchCBU','U') IS NOT NULL DROP TABLE #MatchCBU;
-        CREATE TABLE #MatchCBU
-        (
-            idPersona         INT NOT NULL,
-            idUnidadFuncional INT NOT NULL,
-            idConsorcio       INT NOT NULL,
-            esInquilino       BIT NOT NULL
-        );
+        /* 4) VINCULAR Persona y Consorcio por el MISMO CBU_CVU y upsert en UFPersona (sin idUnidadFuncional) */
+IF OBJECT_ID('tempdb.#MatchCBU','U') IS NOT NULL DROP TABLE #MatchCBU;
+CREATE TABLE #MatchCBU
+(
+    idPersona    INT NOT NULL,
+    idConsorcio  INT NOT NULL,
+    esInquilino  BIT NOT NULL
+);
 
-        INSERT INTO #MatchCBU (idPersona, idUnidadFuncional, idConsorcio, esInquilino)
-        SELECT
-            p.idPersona,
-            u.idUnidadFuncional,
-            u.idConsorcio,
-            s.esInquilino
-        FROM #Stg s
-        JOIN app.Tbl_Persona p WITH (INDEX = IDX_CVU_CBU_PERSONA)
-              ON p.CBU_CVU = s.cbu_cvu
-        JOIN app.Tbl_UnidadFuncional u
-              ON u.CBU_CVU = s.cbu_cvu;   -- MISMO CBU_CVU en la UF
+INSERT INTO #MatchCBU (idPersona, idConsorcio, esInquilino)
+SELECT
+    p.idPersona,
+    u.idConsorcio,
+    s.esInquilino
+FROM #Stg s
+JOIN app.Tbl_Persona         p WITH (INDEX = IDX_CVU_CBU_PERSONA)   ON p.CBU_CVU = s.cbu_cvu
+JOIN app.Tbl_UnidadFuncional u WITH (INDEX = UQ_UnidadFuncional_CBU_CVU) ON u.CBU_CVU = s.cbu_cvu;
 
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @Det4 NVARCHAR(4000) = CONCAT(N'matcheos_cbu=', (SELECT COUNT(*) FROM #MatchCBU));
-            EXEC reportes.Sp_LogReporte
-                 @Procedimiento = @Procedimiento,
-                 @Tipo          = 'INFO',
-                 @Mensaje       = N'Match Persona↔UF por CBU',
-                 @Detalle       = @Det4,
-                 @RutaArchivo   = @RutaArchivo,
-                 @RutaLog       = @LogPath;
-        END
+IF @Verbose = 1
+BEGIN
+    DECLARE @Det4 NVARCHAR(4000) = CONCAT(N'matcheos_cbu=', (SELECT COUNT(*) FROM #MatchCBU));
+    EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Match Persona↔Consorcio por CBU', @Det4, @RutaArchivo, @LogPath;
+END
 
-        -- UPDATE si ya existe (idPersona + idUnidadFuncional)
-        UPDATE uf
-           SET uf.esInquilino = m.esInquilino
-        FROM app.Tbl_UFPersona uf WITH (INDEX = IDX_UF_PERSONA)
-        JOIN #MatchCBU m
-          ON m.idPersona = uf.idPersona
-         AND m.idUnidadFuncional = uf.idUnidadFuncional;
+-- UPDATE si ya existe (idPersona + idConsorcio)
+UPDATE uf
+   SET uf.esInquilino = m.esInquilino
+FROM app.Tbl_UFPersona uf
+JOIN #MatchCBU m
+  ON m.idPersona = uf.idPersona
+ AND m.idConsorcio = uf.idConsorcio;
 
-        DECLARE @RowsUpd INT = @@ROWCOUNT;
+DECLARE @RowsUpd INT = @@ROWCOUNT;
 
-        -- INSERT si no existe
-        INSERT INTO app.Tbl_UFPersona
-            (idPersona, idUnidadFuncional, idConsorcio, esInquilino, fechaInicio, fechaFin)
-        SELECT
-            m.idPersona, m.idUnidadFuncional, m.idConsorcio, m.esInquilino, NULL, NULL
-        FROM #MatchCBU m
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM app.Tbl_UFPersona uf WITH (INDEX = IDX_UF_PERSONA)
-            WHERE uf.idPersona = m.idPersona
-              AND uf.idUnidadFuncional = m.idUnidadFuncional
-        );
+-- INSERT si no existe (idPersona + idConsorcio)
+INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino, fechaInicio, fechaFin)
+SELECT m.idPersona, m.idConsorcio, m.esInquilino, NULL, NULL
+FROM #MatchCBU m
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM app.Tbl_UFPersona uf
+    WHERE uf.idPersona   = m.idPersona
+      AND uf.idConsorcio = m.idConsorcio
+);
 
-        DECLARE @RowsIns INT = @@ROWCOUNT;
+DECLARE @RowsIns INT = @@ROWCOUNT;
 
         /* 5) Resumen */
         DECLARE @TotCsv INT = (SELECT COUNT(*) FROM #Raw);
@@ -1125,6 +1103,7 @@ BEGIN
         /* 1) Leer JSON completo */
         DECLARE @json NVARCHAR(MAX);
         DECLARE @RutaEsc NVARCHAR(4000) = REPLACE(@RutaArchivo, N'''', N'''''');
+
         DECLARE @sql NVARCHAR(MAX) =
         N'SELECT @jsonOut = BulkColumn
           FROM OPENROWSET (BULK ''' + @RutaEsc + N''', SINGLE_CLOB) AS j;';
@@ -1270,66 +1249,80 @@ BEGIN
             EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Totales por mes', @DetSum, @RutaArchivo, @LogPath;
         END
 
-        /* 6) Crear/Actualizar Expensas */
-        IF OBJECT_ID('tempdb..#exp') IS NOT NULL DROP TABLE #exp;
-        CREATE TABLE #exp (idConsorcio INT, mes TINYINT, nroExpensa INT);
+        /* 6) Crear/Actualizar Expensas (SET-BASED, sin cursor, con clamp a DEC(10,2)) */
+IF OBJECT_ID('tempdb..#exp') IS NOT NULL DROP TABLE #exp;
+IF OBJECT_ID('tempdb..#merge_out') IS NOT NULL DROP TABLE #merge_out;
+CREATE TABLE #merge_out(accion NVARCHAR(10));
 
-        DECLARE @ExpensasCreadas INT = 0, @ExpensasActualizadas INT = 0;
+;WITH calc AS (
+    -- Partimos de #exp_sum (idConsorcio, mes, total)
+    SELECT
+        es.idConsorcio,
+        es.mes,
+        es.total,
+        fechaGeneracion = DATEFROMPARTS(@Anio, es.mes, 1),
+        finMes         = EOMONTH(DATEFROMPARTS(@Anio, es.mes, 1))
+    FROM #exp_sum es
+),
+src AS (
+    SELECT
+        c.idConsorcio,
+        c.mes,
+        c.fechaGeneracion,
+        vto1 = CASE 
+                 WHEN @DiaVto1 IS NULL THEN c.finMes
+                 ELSE DATEFROMPARTS(YEAR(c.fechaGeneracion), MONTH(c.fechaGeneracion),
+                                    IIF(@DiaVto1 > DAY(c.finMes), DAY(c.finMes), @DiaVto1))
+               END,
+        vto2 = CASE 
+                 WHEN @DiaVto2 IS NULL THEN c.finMes
+                 ELSE DATEFROMPARTS(YEAR(c.fechaGeneracion), MONTH(c.fechaGeneracion),
+                                    IIF(@DiaVto2 > DAY(c.finMes), DAY(c.finMes), @DiaVto2))
+               END,
+        -- clamp a DEC(10,2) para respetar Tbl_Expensa.montoTotal
+        montoTotal = CAST(CASE 
+                            WHEN c.total >  99999999.99 THEN  99999999.99
+                            WHEN c.total < -99999999.99 THEN -99999999.99
+                            ELSE c.total
+                          END AS DECIMAL(10,2))
+    FROM calc c
+)
+MERGE app.Tbl_Expensa AS T
+USING src AS S
+   ON T.idConsorcio     = S.idConsorcio
+  AND T.fechaGeneracion = S.fechaGeneracion
+WHEN MATCHED THEN
+    UPDATE SET T.fechaVto1  = S.vto1,
+               T.fechaVto2  = S.vto2,
+               T.montoTotal = S.montoTotal
+WHEN NOT MATCHED THEN
+    INSERT (idConsorcio, fechaGeneracion, fechaVto1, fechaVto2, montoTotal)
+    VALUES (S.idConsorcio, S.fechaGeneracion, S.vto1, S.vto2, S.montoTotal)
+OUTPUT $action INTO #merge_out;
 
-        DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
-            SELECT idConsorcio, mes, total FROM #exp_sum;
-        DECLARE @idC INT, @mes TINYINT, @total DECIMAL(18,2);
+-- mismas métricas que antes
+DECLARE @ExpensasCreadas INT        = (SELECT COUNT(*) FROM #merge_out WHERE accion = 'INSERT');
+DECLARE @ExpensasActualizadas INT   = (SELECT COUNT(*) FROM #merge_out WHERE accion = 'UPDATE');
 
-        OPEN cur;
-        FETCH NEXT FROM cur INTO @idC, @mes, @total;
-        WHILE @@FETCH_STATUS = 0
-        BEGIN
-            DECLARE @fechaGen DATE = DATEFROMPARTS(@Anio, @mes, 1);
-            DECLARE @finMes  DATE = EOMONTH(@fechaGen);
-            DECLARE @v1 DATE = IIF(@DiaVto1 IS NULL, @finMes,
-                                   DATEFROMPARTS(@Anio, @mes, IIF(@DiaVto1 > DAY(@finMes), DAY(@finMes), @DiaVto1)));
-            DECLARE @v2 DATE = IIF(@DiaVto2 IS NULL, @finMes,
-                                   DATEFROMPARTS(@Anio, @mes, IIF(@DiaVto2 > DAY(@finMes), DAY(@finMes), @DiaVto2)));
+-- reconstruimos #exp (idConsorcio, mes, nroExpensa) para que el bloque 7 siga igual
+SELECT c.idConsorcio,
+       c.mes,
+       e.nroExpensa
+INTO #exp
+FROM (SELECT DISTINCT idConsorcio, mes FROM #exp_sum) AS c
+JOIN app.Tbl_Expensa e
+  ON e.idConsorcio     = c.idConsorcio
+ AND e.fechaGeneracion = DATEFROMPARTS(@Anio, c.mes, 1);
 
-            DECLARE @nroExp INT;
+IF @Verbose = 1
+BEGIN
+    DECLARE @DetExp NVARCHAR(4000) =
+        N'expensas_creadas=' + CONVERT(NVARCHAR(20), @ExpensasCreadas) +
+        N'; expensas_actualizadas=' + CONVERT(NVARCHAR(20), @ExpensasActualizadas);
+    EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Expensas procesadas', @DetExp, @RutaArchivo, @LogPath;
+END
 
-            SELECT @nroExp = e.nroExpensa
-            FROM app.Tbl_Expensa e
-            WHERE e.idConsorcio = @idC
-              AND e.fechaGeneracion = @fechaGen;
-
-            IF @nroExp IS NULL
-            BEGIN
-                INSERT INTO app.Tbl_Expensa (idConsorcio, fechaGeneracion, fechaVto1, fechaVto2, montoTotal)
-                VALUES (@idC, @fechaGen, @v1, @v2, @total);
-                SET @nroExp = SCOPE_IDENTITY();
-                SET @ExpensasCreadas += 1;
-            END
-            ELSE
-            BEGIN
-                UPDATE app.Tbl_Expensa
-                   SET montoTotal = @total,
-                       fechaVto1  = @v1,
-                       fechaVto2  = @v2
-                 WHERE nroExpensa = @nroExp;
-                SET @ExpensasActualizadas += 1;
-            END
-
-            INSERT INTO #exp(idConsorcio, mes, nroExpensa) VALUES (@idC, @mes, @nroExp);
-
-            FETCH NEXT FROM cur INTO @idC, @mes, @total;
-        END
-        CLOSE cur; DEALLOCATE cur;
-
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @DetExp NVARCHAR(4000) =
-                N'expensas_creadas=' + CONVERT(NVARCHAR(20), @ExpensasCreadas) +
-                N'; expensas_actualizadas=' + CONVERT(NVARCHAR(20), @ExpensasActualizadas);
-            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Expensas procesadas', @DetExp, @RutaArchivo, @LogPath;
-        END
-
-        /* 7) Insertar Gastos + capturar categorías */
+        /* 7) Insertar Gastos + capturar categorías (importe clamped a DEC(10,2)) */
         IF OBJECT_ID('tempdb..#ins') IS NOT NULL DROP TABLE #ins;
         CREATE TABLE #ins
         (
@@ -1340,14 +1333,20 @@ BEGIN
         MERGE app.Tbl_Gasto AS tgt
         USING (
             SELECT 
-                e.nroExpensa                                      AS nroExpensa,
-                c.idConsorcio                                     AS idConsorcio,
-                CASE WHEN mx.categoria IS NOT NULL 
-                     THEN N'Extraordinario' ELSE N'Ordinario' END AS tipo,
-                s.categoria                                       AS descripcion,   -- literal desde JSON
-                DATEFROMPARTS(@Anio, s.mes, 1)                    AS fechaEmision,
-                s.importe                                         AS importe,
-                s.categoria                                       AS categoria
+                e.nroExpensa                                                    AS nroExpensa,
+                c.idConsorcio                                                   AS idConsorcio,
+                /* tipar + collation para evitar conflictos */
+                CAST(CASE WHEN mx.categoria IS NOT NULL 
+                          THEN 'Extraordinario' ELSE 'Ordinario' END AS VARCHAR(16)) COLLATE DATABASE_DEFAULT AS tipo,
+                s.categoria                                                     AS descripcion,   -- literal desde JSON
+                DATEFROMPARTS(@Anio, s.mes, 1)                                  AS fechaEmision,
+                /* clamp + cast para respetar DEC(10,2) de Tbl_Gasto.importe */
+                CAST(CASE 
+                        WHEN s.importe >  99999999.99 THEN  99999999.99
+                        WHEN s.importe < -99999999.99 THEN -99999999.99
+                        ELSE s.importe
+                    END AS DECIMAL(10,2))                                       AS importe,
+                s.categoria                                                     AS categoria
             FROM #stg_gasto s
             INNER JOIN #cons c  ON c.consorcio = s.consorcio COLLATE DATABASE_DEFAULT
             INNER JOIN #exp e   ON e.idConsorcio = c.idConsorcio AND e.mes = s.mes
@@ -1430,13 +1429,13 @@ END
 GO
 -- //////////////////////////////////////////////////////////////////////
 CREATE OR ALTER PROCEDURE importacion.Sp_CargarPagosDesdeCsv
-    @RutaArchivo      NVARCHAR(4000),          -- Ej: N'C:\Data\pagos_consorcios.csv'
-    @HDR              BIT           = 1,       -- 1 = primera fila encabezado; 0 = no
-    @Separador        CHAR(1)       = ',',     -- separador de campos (',' ';' '|', etc.)
-    @RowTerminator    NVARCHAR(10)  = N'0x0d0a', -- CRLF; usar N'0x0a' si solo LF
-    @CodePage         NVARCHAR(16)  = N'65001',  -- '65001' UTF-8, 'ACP' ANSI
-    @LogPath          NVARCHAR(4000) = NULL,   -- ruta opcional del .log
-    @Verbose          BIT           = 1        -- 1 = loguea INFO/WARN
+    @RutaArchivo      NVARCHAR(4000),
+    @HDR              BIT           = 1,
+    @Separador        CHAR(1)       = ',',
+    @RowTerminator    NVARCHAR(10)  = N'0x0d0a',
+    @CodePage         NVARCHAR(16)  = N'65001',
+    @LogPath          NVARCHAR(4000) = NULL,
+    @Verbose          BIT           = 1
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -1444,9 +1443,7 @@ BEGIN
     DECLARE @Procedimiento SYSNAME = N'importacion.Sp_CargarPagosDesdeCsv';
 
     BEGIN TRY
-        /* =======================================================================
-           0) INICIO
-        ======================================================================= */
+        /* =============================== 0) INICIO =============================== */
         IF @Verbose = 1
             EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Inicio del proceso', NULL, @RutaArchivo, @LogPath;
 
@@ -1487,11 +1484,10 @@ BEGIN
             valor_txt   NVARCHAR(4000) COLLATE DATABASE_DEFAULT
         );
 
-        /* =======================================================================
-           1) BULK INSERT a #raw
-        ======================================================================= */
+        /* =============================== 1) BULK =============================== */
         DECLARE @PrimeraFila INT = CASE WHEN @HDR = 1 THEN 2 ELSE 1 END;
         DECLARE @RutaEsc NVARCHAR(4000) = REPLACE(@RutaArchivo, N'''', N'''''');
+
         DECLARE @SqlBulk NVARCHAR(MAX) =
             CONCAT(
                 N'BULK INSERT #raw FROM ''', @RutaEsc, N''' WITH (',
@@ -1518,9 +1514,7 @@ BEGIN
             EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'CSV leído', @DetRaw, @RutaArchivo, @LogPath;
         END
 
-        /* =======================================================================
-           2) Normalización flexible -> #norm (acepta 3 o 4 columnas)
-        ======================================================================= */
+        /* =============================== 2) Normalización =============================== */
         INSERT INTO #norm (id_pago_txt, fecha_txt, cbu_txt, valor_txt)
         SELECT
             CASE WHEN NULLIF(LTRIM(RTRIM(c4)),'') IS NOT NULL THEN c1 ELSE NULL END,
@@ -1536,9 +1530,7 @@ BEGIN
             EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Normalización lista', @DetNorm, @RutaArchivo, @LogPath;
         END
 
-        /* =======================================================================
-           3) Parseo robusto de fecha e importe -> #pagos
-        ======================================================================= */
+        /* =============================== 3) Parseo -> #pagos =============================== */
         ;WITH pre AS (
             SELECT
                 fecha_txt,
@@ -1548,9 +1540,7 @@ BEGIN
             FROM #norm
         ),
         norm_val AS (
-            SELECT
-                fecha_txt, cbu_txt, valor_txt,
-                REPLACE(REPLACE(v0, N'.', N''), N',', N'.') AS v1
+            SELECT fecha_txt, cbu_txt, valor_txt, REPLACE(REPLACE(v0, N'.', N''), N',', N'.') AS v1
             FROM pre
         ),
         recorte AS (
@@ -1584,7 +1574,7 @@ BEGIN
             EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Parseo de pagos', @DetPagos, @RutaArchivo, @LogPath;
         END
 
-        /* Errores de parseo (internos) */
+        /* Errores de parseo */
         INSERT INTO #errores (motivo, fecha_txt, cbu_txt, valor_txt)
         SELECT
             N'Fila inválida (fecha/valor/CBU)',
@@ -1607,34 +1597,35 @@ BEGIN
             EXEC reportes.Sp_LogReporte @Procedimiento, 'WARN', N'Filas descartadas por parseo', @DetErrParseo, @RutaArchivo, @LogPath;
         END
 
-        /* =======================================================================
-           4) Enriquecer: Persona, UF, Consorcio y Expensa del MES del pago
-        ======================================================================= */
-        ;WITH pagos_enriq AS (
+        /* =============================== 4) Enriquecer (Persona/UF/Consorcio/Expensa) =============================== */
+        ;WITH pagos_enriq AS
+        (
             SELECT
                 p.fecha,
+                p.valor                AS monto,
                 p.CBU_CVU,
-                p.valor,
                 per.idPersona,
-                ufp.idUnidadFuncional,
-                ufp.idConsorcio
+                uf.idUnidadFuncional,
+                uf.idConsorcio
             FROM #pagos p
-            LEFT JOIN app.Tbl_Persona   per WITH (INDEX = IDX_CVU_CBU_PERSONA)
-                ON per.CBU_CVU = p.CBU_CVU
-            LEFT JOIN app.Tbl_UFPersona ufp WITH (INDEX = IDX_UF_PERSONA)
-                ON ufp.idPersona = per.idPersona
+            LEFT JOIN app.Tbl_Persona         per WITH (INDEX = IDX_CVU_CBU_PERSONA) ON per.CBU_CVU = p.CBU_CVU
+            LEFT JOIN app.Tbl_UnidadFuncional uf  /* si tenés un índice único por CBU_CVU, el optimizador lo usa */ 
+                   ON uf.CBU_CVU = p.CBU_CVU
         )
         SELECT
             pe.*,
             e.nroExpensa
         INTO #pagos_completos
         FROM pagos_enriq pe
-        OUTER APPLY (
+        CROSS APPLY (VALUES (DATEFROMPARTS(YEAR(pe.fecha), MONTH(pe.fecha), 1))) AS m(inicioMes)
+        OUTER APPLY
+        (
+            /* Rango sargable: [primer día del mes, primer día del mes siguiente) */
             SELECT TOP (1) e.nroExpensa
-            FROM app.Tbl_Expensa e WITH (INDEX = IDX_EXPENSA)
+            FROM app.Tbl_Expensa e
             WHERE e.idConsorcio = pe.idConsorcio
-              AND YEAR(e.fechaGeneracion) = YEAR(pe.fecha)
-              AND MONTH(e.fechaGeneracion) = MONTH(pe.fecha)
+              AND e.fechaGeneracion >= m.inicioMes
+              AND e.fechaGeneracion <  DATEADD(MONTH, 1, m.inicioMes)
             ORDER BY e.fechaGeneracion DESC, e.nroExpensa DESC
         ) e;
 
@@ -1642,28 +1633,21 @@ BEGIN
         INSERT INTO #errores (motivo, fecha_txt, cbu_txt, valor_txt)
         SELECT
             CASE 
-              WHEN idPersona IS NULL THEN N'CBU no existe en Tbl_Persona'
-              WHEN idUnidadFuncional IS NULL THEN N'Persona sin relación en Tbl_UFPersona'
-              WHEN idConsorcio IS NULL THEN N'No se determinó Consorcio'
-              WHEN nroExpensa IS NULL THEN N'No hay expensa del mes para el consorcio'
+              WHEN idPersona IS NULL         THEN N'CBU no existe en Tbl_Persona'
+              WHEN idUnidadFuncional IS NULL THEN N'No se encontró UF para ese CBU'
+              WHEN idConsorcio IS NULL       THEN N'No se determinó Consorcio'
+              WHEN nroExpensa IS NULL        THEN N'No hay expensa del mes para el consorcio'
             END,
             CONVERT(NVARCHAR(30), fecha, 121),
             CBU_CVU,
-            CONVERT(NVARCHAR(40), valor)
+            CONVERT(NVARCHAR(40), monto)
         FROM #pagos_completos
         WHERE idPersona IS NULL
            OR idUnidadFuncional IS NULL
            OR idConsorcio IS NULL
            OR nroExpensa IS NULL;
 
-        DECLARE @ErroresMatch INT = (SELECT COUNT(*) FROM #errores) - @ErroresParseo;
-        IF @ErroresMatch > 0 AND @Verbose = 1
-        BEGIN
-            DECLARE @DetErrMatch NVARCHAR(4000) = CONCAT(N'falla_match=', CONVERT(NVARCHAR(20), @ErroresMatch));
-            EXEC reportes.Sp_LogReporte @Procedimiento, 'WARN', N'Filas sin mapping completo', @DetErrMatch, @RutaArchivo, @LogPath;
-        END
-
-        /* Solo OK para inserción */
+        /* Filas válidas */
         IF OBJECT_ID('tempdb..#ok') IS NOT NULL DROP TABLE #ok;
         SELECT *
         INTO #ok
@@ -1673,16 +1657,23 @@ BEGIN
           AND idConsorcio IS NOT NULL
           AND nroExpensa IS NOT NULL;
 
-        DECLARE @FilasOK INT = (SELECT COUNT(*) FROM #ok);
+        /* >>> FALTABAN ESTAS VARIABLES <<< */
+        DECLARE @ErroresMatch INT = (SELECT COUNT(*) FROM #errores) - @ErroresParseo;
+        DECLARE @FilasOK     INT = (SELECT COUNT(*) FROM #ok);
+
+        IF @ErroresMatch > 0 AND @Verbose = 1
+        BEGIN
+            DECLARE @DetErrMatch NVARCHAR(4000) = CONCAT(N'falla_match=', CONVERT(NVARCHAR(20), @ErroresMatch));
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'WARN', N'Filas sin mapping completo', @DetErrMatch, @RutaArchivo, @LogPath;
+        END
+
         IF @Verbose = 1
         BEGIN
             DECLARE @DetOK NVARCHAR(4000) = CONCAT(N'pagos_ok=', CONVERT(NVARCHAR(20), @FilasOK));
             EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Filas listas para inserción', @DetOK, @RutaArchivo, @LogPath;
         END
 
-        /* =======================================================================
-           5) Asegurar EstadoCuenta y crear Pagos
-        ======================================================================= */
+        /* =============================== 5) EC + Pagos =============================== */
         ;WITH base_ec AS (
             SELECT DISTINCT
                 o.idUnidadFuncional,
@@ -1718,30 +1709,28 @@ BEGIN
             o.idConsorcio,
             o.nroExpensa,
             o.fecha,
-            o.valor,
+            o.monto,
             o.CBU_CVU
         FROM #ok o
         INNER JOIN app.Tbl_EstadoCuenta ec
                 ON ec.nroUnidadFuncional = o.idUnidadFuncional
                AND ec.idConsorcio       = o.idConsorcio
                AND ec.nroExpensa        = o.nroExpensa
-        OPTION (USE HINT('DISABLE_OPTIMIZED_PLAN_FORCING')); -- estable
+        OPTION (USE HINT('DISABLE_OPTIMIZED_PLAN_FORCING'));
 
         DECLARE @PagosInsertados INT = @@ROWCOUNT;
 
         IF @Verbose = 1
         BEGIN
-            DECLARE @DetEC NVARCHAR(4000) = CONCAT(N'estado_cuenta_creados=', CONVERT(NVARCHAR(20), @EC_Creados));
+            DECLARE @DetEC NVARCHAR(4000)  = CONCAT(N'estado_cuenta_creados=', CONVERT(NVARCHAR(20), @EC_Creados));
+            DECLARE @DetPago NVARCHAR(4000)= CONCAT(N'pagos_insertados=', CONVERT(NVARCHAR(20), @PagosInsertados));
             EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'EstadoCuenta asegurado', @DetEC, @RutaArchivo, @LogPath;
-
-            DECLARE @DetPago NVARCHAR(4000) = CONCAT(N'pagos_insertados=', CONVERT(NVARCHAR(20), @PagosInsertados));
-            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Pagos insertados', @DetPago, @RutaArchivo, @LogPath;
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Pagos insertados',         @DetPago, @RutaArchivo, @LogPath;
         END
 
-        /* =======================================================================
-           6) Resumen y salida
-        ======================================================================= */
-        DECLARE @Resumen NVARCHAR(4000) =
+        /* =============================== 6) Resumen =============================== */
+        DECLARE @Resumen NVARCHAR(4000);
+        SET @Resumen =
             CONCAT(
                 N'raw=', @FilasRaw,
                 N'; norm=', @FilasNorm,
@@ -1757,15 +1746,15 @@ BEGIN
             EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Fin OK', @Resumen, @RutaArchivo, @LogPath;
 
         SELECT
-            filas_raw            = @FilasRaw,
-            filas_norm           = @FilasNorm,
-            pagos_validos        = @FilasPagos,
-            errores_parseo       = @ErroresParseo,
-            errores_match        = @ErroresMatch,
-            pagos_listos         = @FilasOK,
-            estado_cuenta_creados= @EC_Creados,
-            pagos_insertados     = @PagosInsertados,
-            mensaje              = N'OK';
+            filas_raw              = @FilasRaw,
+            filas_norm             = @FilasNorm,
+            pagos_validos          = @FilasPagos,
+            errores_parseo         = @ErroresParseo,
+            errores_match          = @ErroresMatch,
+            pagos_listos           = @FilasOK,
+            estado_cuenta_creados  = @EC_Creados,
+            pagos_insertados       = @PagosInsertados,
+            mensaje                = N'OK';
     END TRY
     BEGIN CATCH
         DECLARE @MsgError NVARCHAR(4000) = ERROR_MESSAGE();
@@ -1782,97 +1771,118 @@ BEGIN
 END
 GO
 -- //////////////////////////////////////////////////////////////////////
+USE Com5600G13;
+GO
+
 CREATE OR ALTER PROCEDURE app.Sp_CargarGastosExtraordinariosIniciales
     @Verbose BIT = 0
 AS
 BEGIN
     SET NOCOUNT ON;
-    
-    DECLARE @Insertados INT = 0;
-    
-    -- Tabla temporal con los datos correctos (CON IMPORTES)
+
     IF OBJECT_ID('tempdb..#GastosTemp') IS NOT NULL DROP TABLE #GastosTemp;
     CREATE TABLE #GastosTemp (
-        nroExpensa INT,
-        idConsorcio INT,
-        tipo VARCHAR(16) COLLATE DATABASE_DEFAULT,
-        descripcion VARCHAR(200) COLLATE DATABASE_DEFAULT,
-        fechaEmision DATE,
-        importe DECIMAL(10,2),  -- IMPORTANTE: Ahora con valores
-        cuotaActual TINYINT,
-        cantCuotas TINYINT
+        idConsorcio   INT,
+        descripcion   VARCHAR(200) COLLATE DATABASE_DEFAULT,
+        fechaEmision  DATE,
+        importe       DECIMAL(10,2),
+        cuotaActual   TINYINT,
+        cantCuotas    TINYINT
     );
-    
-    -- Cargar datos con IMPORTES CORRECTOS
-    INSERT INTO #GastosTemp VALUES
-    (1, 1, 'Extraordinario', 'Reparación integral de fachada y balcones', '2025-11-01', 145000.00, 2, 7),
-    (2, 2, 'Extraordinario', 'Renovación total del sistema eléctrico del edificio', '2025-07-06', 230000.00, 2, 5),
-    (3, 3, 'Extraordinario', 'Instalación de sistema contra incendios', '2025-04-22', 100000.00, 1, 2),
-    (4, 4, 'Extraordinario', 'Impermeabilización y refacción del techo del edificio', '2025-12-30', 500000.00, 1, 1),
-    (5, 5, 'Extraordinario', 'Ampliación del área común y terminaciones completas en cerámico y luminarias', '2025-08-19', 210000.00, 5, 6);
-    
-    -- Insertar solo los que NO existen (por descripción + consorcio + expensa)
-    INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
-    SELECT t.nroExpensa, t.idConsorcio, t.tipo, t.descripcion, t.fechaEmision, t.importe
-    FROM #GastosTemp t
+
+    /* Cargá acá tus casos (podés agregar/editar a gusto) */
+    INSERT INTO #GastosTemp
+    VALUES
+      (1, 'Reparación integral de fachada y balcones',          '2025-11-01', 145000.00, 2, 7),
+      (2, 'Renovación total del sistema eléctrico del edificio','2025-07-06', 230000.00, 2, 5),
+      (3, 'Instalación de sistema contra incendios',            '2025-04-22', 100000.00, 1, 2),
+      (4, 'Impermeabilización y refacción de techo',            '2025-12-30', 500000.00, 1, 1),
+      (5, 'Ampliación de área común + terminaciones',           '2025-08-19', 210000.00, 5, 6),
+      (6, 'Reparación integral de pisos',                       '2025-04-07',   4000.00, 2, 4);
+
+    /* 1) Asegurar consorcios (si los Ids no existen aún) */
+    IF EXISTS (SELECT 1 FROM #GastosTemp gt
+               LEFT JOIN app.Tbl_Consorcio c ON c.idConsorcio = gt.idConsorcio
+               WHERE c.idConsorcio IS NULL)
+    BEGIN
+        SET IDENTITY_INSERT app.Tbl_Consorcio ON;
+        INSERT INTO app.Tbl_Consorcio (idConsorcio, nombre)
+        SELECT DISTINCT gt.idConsorcio, CONCAT('Consorcio ', gt.idConsorcio)
+        FROM #GastosTemp gt
+        LEFT JOIN app.Tbl_Consorcio c ON c.idConsorcio = gt.idConsorcio
+        WHERE c.idConsorcio IS NULL;
+        SET IDENTITY_INSERT app.Tbl_Consorcio OFF;
+    END
+
+    /* 2) Expensas por (Consorcio, fechaEmision) */
+    IF OBJECT_ID('tempdb..#Exp') IS NOT NULL DROP TABLE #Exp;
+    CREATE TABLE #Exp (
+        idConsorcio INT PRIMARY KEY,
+        fecha DATE,
+        nroExpensa INT
+    );
+
+    -- Crear las que falten
+    INSERT INTO app.Tbl_Expensa (idConsorcio, fechaGeneracion, fechaVto1, fechaVto2, montoTotal)
+    SELECT DISTINCT gt.idConsorcio, gt.fechaEmision, NULL, NULL, 0
+    FROM #GastosTemp gt
     WHERE NOT EXISTS (
-        SELECT 1 
-        FROM app.Tbl_Gasto g
-        WHERE g.nroExpensa = t.nroExpensa
-          AND g.idConsorcio = t.idConsorcio
-          AND g.descripcion COLLATE DATABASE_DEFAULT = t.descripcion COLLATE DATABASE_DEFAULT
+        SELECT 1 FROM app.Tbl_Expensa e
+        WHERE e.idConsorcio = gt.idConsorcio
+          AND e.fechaGeneracion = gt.fechaEmision
     );
-    
-    SET @Insertados = @@ROWCOUNT;
-    
-    -- Insertar detalles extraordinarios (solo para gastos recién insertados)
-    INSERT INTO app.Tbl_Gasto_Extraordinario (idGasto, cuotaActual, cantCuotas)
-    SELECT g.idGasto, t.cuotaActual, t.cantCuotas
-    FROM app.Tbl_Gasto g
-    INNER JOIN #GastosTemp t 
-        ON g.nroExpensa = t.nroExpensa 
-        AND g.idConsorcio = t.idConsorcio
-        AND g.descripcion COLLATE DATABASE_DEFAULT = t.descripcion COLLATE DATABASE_DEFAULT
-    WHERE NOT EXISTS (
-        SELECT 1 
-        FROM app.Tbl_Gasto_Extraordinario ge
-        WHERE ge.idGasto = g.idGasto
-    );
-    
-    -- Actualizar montos totales de expensas
-    UPDATE e
-    SET e.montoTotal = (
-        SELECT ISNULL(SUM(g.importe), 0)
-        FROM app.Tbl_Gasto g
-        WHERE g.nroExpensa = e.nroExpensa
-          AND g.idConsorcio = e.idConsorcio
-    )
+
+    -- Cargar mapeo a temp
+    INSERT INTO #Exp(idConsorcio, fecha, nroExpensa)
+    SELECT e.idConsorcio, e.fechaGeneracion, e.nroExpensa
     FROM app.Tbl_Expensa e
-    WHERE e.nroExpensa IN (SELECT DISTINCT nroExpensa FROM #GastosTemp);
-    
+    JOIN (SELECT DISTINCT idConsorcio, fechaEmision FROM #GastosTemp) d
+      ON d.idConsorcio = e.idConsorcio AND d.fechaEmision = e.fechaGeneracion;
+
+    /* 3) Insertar GASTO Extraordinario evitando duplicados */
+    INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
+    SELECT x.nroExpensa, gt.idConsorcio, 'Extraordinario', gt.descripcion, gt.fechaEmision, gt.importe
+    FROM #GastosTemp gt
+    JOIN #Exp x ON x.idConsorcio = gt.idConsorcio AND x.fecha = gt.fechaEmision
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM app.Tbl_Gasto g
+        WHERE g.idConsorcio = gt.idConsorcio
+          AND g.nroExpensa  = x.nroExpensa
+          AND g.tipo        = 'Extraordinario'
+          AND ISNULL(g.descripcion,'') = ISNULL(gt.descripcion,'')
+    );
+
+    /* 4) Detalle Extraordinario: solo si falta para esos gastos */
+    INSERT INTO app.Tbl_Gasto_Extraordinario (idGasto, cuotaActual, cantCuotas)
+    SELECT g.idGasto, gt.cuotaActual, gt.cantCuotas
+    FROM #GastosTemp gt
+    JOIN #Exp x ON x.idConsorcio = gt.idConsorcio AND x.fecha = gt.fechaEmision
+    JOIN app.Tbl_Gasto g
+      ON g.idConsorcio = gt.idConsorcio
+     AND g.nroExpensa  = x.nroExpensa
+     AND g.tipo        = 'Extraordinario'
+     AND ISNULL(g.descripcion,'') = ISNULL(gt.descripcion,'')
+    WHERE NOT EXISTS (SELECT 1 FROM app.Tbl_Gasto_Extraordinario ge WHERE ge.idGasto = g.idGasto);
+
+    /* 5) Recalcular montos de las expensas afectadas */
+    UPDATE e
+       SET e.montoTotal = (
+            SELECT ISNULL(SUM(g.importe),0)
+            FROM app.Tbl_Gasto g
+            WHERE g.idConsorcio = e.idConsorcio AND g.nroExpensa = e.nroExpensa
+       )
+    FROM app.Tbl_Expensa e
+    JOIN #Exp x ON x.idConsorcio = e.idConsorcio AND x.nroExpensa = e.nroExpensa;
+
     IF @Verbose = 1
     BEGIN
-        SELECT 
-            gastos_insertados = @Insertados,
-            mensaje = CASE 
-                WHEN @Insertados = 0 THEN 'Los datos ya existían, no se insertó nada'
-                ELSE 'Datos insertados correctamente'
-            END;
-            
-        -- Mostrar resumen
-        PRINT '';
         PRINT 'Resumen de gastos extraordinarios:';
-        SELECT 
-            g.nroExpensa,
-            g.descripcion,
-            g.importe,
-            ge.cuotaActual,
-            ge.cantCuotas
+        SELECT g.idConsorcio, g.nroExpensa, g.descripcion, g.importe, ge.cuotaActual, ge.cantCuotas
         FROM app.Tbl_Gasto g
-        INNER JOIN app.Tbl_Gasto_Extraordinario ge ON ge.idGasto = g.idGasto
-        WHERE g.tipo = 'Extraordinario';
+        JOIN app.Tbl_Gasto_Extraordinario ge ON ge.idGasto = g.idGasto
+        WHERE g.tipo = 'Extraordinario'
+        ORDER BY g.idConsorcio, g.nroExpensa, g.idGasto;
     END
-    
-    RETURN @Insertados;
 END
 GO

@@ -3,6 +3,7 @@ tablas -> Tbl_[NombreTabla] -> ejemplo: Tbl_Usuario
 vistas -> Vw_[NombreVista]
 procedimientos almacenados -> Sp_[NombreProcedimiento]
 
+
 campos -> [nombreCampo] -> ejemplo: idUsuario
 primary Key -> [NombreTabla] -> ejemplo: Usuario
 */
@@ -27,6 +28,9 @@ IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'importacion') EXEC ('CRE
 
 /** Este esquema se utilizará para referenciar a los objetos relacionados directamente con la aplicación **/
 IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'app') EXEC ('CREATE SCHEMA app');
+
+/** Este esquema se utilizará para referenciar a los objetos relacionados directamente con la API **/
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'api') EXEC ('CREATE SCHEMA api');
 GO
 
 IF OBJECT_ID(N'app.Tbl_Pago', N'U') IS NOT NULL DROP TABLE app.Tbl_Pago;
@@ -39,6 +43,8 @@ IF OBJECT_ID(N'app.Tbl_UFPersona', N'U') IS NOT NULL DROP TABLE app.Tbl_UFPerson
 IF OBJECT_ID(N'app.Tbl_UnidadFuncional', N'U') IS NOT NULL DROP TABLE app.Tbl_UnidadFuncional;
 IF OBJECT_ID(N'app.Tbl_Consorcio', N'U') IS NOT NULL DROP TABLE app.Tbl_Consorcio;
 IF OBJECT_ID(N'app.Tbl_Persona', N'U') IS NOT NULL DROP TABLE app.Tbl_Persona;
+IF OBJECT_ID(N'api.Tbl_CotizacionDolar', N'U') IS NOT NULL DROP TABLE api.Tbl_CotizacionDolar;
+IF OBJECT_ID(N'reportes.logsReportes', N'U') IS NOT NULL DROP TABLE reportes.logsReportes;
 GO
 
 /* ---- Tbl_Persona ---- */
@@ -47,11 +53,10 @@ CREATE TABLE app.Tbl_Persona (
     nombre VARCHAR(50) NOT NULL,
     apellido VARCHAR(50) NOT NULL,
     dni INT NOT NULL,
-    email VARCHAR(100) UNIQUE,
-    telefono VARCHAR(12),
-    CBU_CVU CHAR(22) UNIQUE,
-    CONSTRAINT CHK_Persona_DNI CHECK (dni > 0 AND dni < 100000000),
-    CONSTRAINT CHK_Persona_Email CHECK (email LIKE '%@%.%' OR email IS NULL)
+    email VARCHAR(100),
+    telefono VARCHAR(20),
+    CBU_CVU CHAR(22) CHECK (CBU_CVU NOT LIKE '%[^0-9]%'),
+    CONSTRAINT CHK_Persona_DNI CHECK (dni > 0 AND dni < 100000000)
 );
 GO
 
@@ -75,7 +80,7 @@ CREATE TABLE app.Tbl_UnidadFuncional (
     metrosBaulera DECIMAL(5,2),
     metrosCochera DECIMAL(5,2),
     porcentaje DECIMAL(5,2),
-    CBU_CVU CHAR(22),
+    CBU_CVU CHAR(22) CHECK (CBU_CVU NOT LIKE '%[^0-9]%'),
     CONSTRAINT FK_UnidadFuncional_Consorcio
         FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio (idConsorcio),
     CONSTRAINT CHK_UF_Superficie CHECK (superficie >= 0 OR superficie IS NULL),
@@ -85,25 +90,16 @@ CREATE TABLE app.Tbl_UnidadFuncional (
 );
 GO
 
--- Índice único filtrado para CBU_CVU (permite múltiples NULL)
-CREATE UNIQUE NONCLUSTERED INDEX UQ_UnidadFuncional_CBU_CVU
-ON app.Tbl_UnidadFuncional(CBU_CVU)
-WHERE CBU_CVU IS NOT NULL;
-GO
-
 /* ---- Tbl_UFPersona ---- */
 CREATE TABLE app.Tbl_UFPersona (
     idPersona INT NOT NULL,
-    idUnidadFuncional INT NOT NULL,
     idConsorcio INT NOT NULL,
     esInquilino BIT,
     fechaInicio DATE,
     fechaFin DATE,
-    CONSTRAINT PK_UFPersona PRIMARY KEY (idPersona, idUnidadFuncional),
+    CONSTRAINT PK_UFPersona PRIMARY KEY (idPersona),
     CONSTRAINT FK_UFPersona_Persona
         FOREIGN KEY (idPersona) REFERENCES app.Tbl_Persona (idPersona),
-    CONSTRAINT FK_UFPersona_UF
-        FOREIGN KEY (idUnidadFuncional) REFERENCES app.Tbl_UnidadFuncional (idUnidadFuncional),
     CONSTRAINT FK_UFPersona_Consorcio
         FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio (idConsorcio),
     CONSTRAINT CHK_UFPersona_Fechas CHECK (fechaFin IS NULL OR fechaFin >= fechaInicio)
@@ -114,7 +110,7 @@ GO
 CREATE TABLE app.Tbl_Expensa (
     nroExpensa INT NOT NULL IDENTITY(1,1) PRIMARY KEY,
     idConsorcio INT NOT NULL,
-    fechaGeneracion DATE,
+    fechaGeneracion DATE NOT NULL,
     fechaVto1 DATE,
     fechaVto2 DATE,
     montoTotal DECIMAL(10,2),
@@ -201,12 +197,38 @@ CREATE TABLE app.Tbl_Pago (
     nroExpensa INT NOT NULL,
     fecha DATE,
     monto DECIMAL(10,2),
-    CBU_CVU VARCHAR(22),
+    CBU_CVU CHAR(22) CHECK (CBU_CVU NOT LIKE '%[^0-9]%'),
     CONSTRAINT FK_Pago_EstadoCuenta
         FOREIGN KEY (idEstadoCuenta, nroUnidadFuncional, idConsorcio)
         REFERENCES app.Tbl_EstadoCuenta (idEstadoCuenta, nroUnidadFuncional, idConsorcio),
     CONSTRAINT FK_Pago_Expensa
         FOREIGN KEY (nroExpensa) REFERENCES app.Tbl_Expensa (nroExpensa),
     CONSTRAINT CHK_Pago_Monto CHECK (monto > 0 OR monto IS NULL)
+);
+GO
+
+/** ---- Tbl_CotizacionDolar ---- **/
+CREATE TABLE api.Tbl_CotizacionDolar (
+    idCotizacion INT NOT NULL IDENTITY(1,1) PRIMARY KEY,
+    fechaConsulta DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    tipoDolar VARCHAR(50) NOT NULL,
+    valorCompra DECIMAL(10,2) NOT NULL,
+    valorVenta DECIMAL(10,2) NOT NULL,
+    CONSTRAINT UQ_CotizacionDolar_FechaTipo 
+        UNIQUE (fechaConsulta, tipoDolar)
+);
+GO
+
+/** ---- logsReportes ---- **/
+CREATE TABLE reportes.logsReportes
+    (
+        idLog INT IDENTITY(1,1) PRIMARY KEY,
+        fecha DATETIME2(3) NOT NULL CONSTRAINT DF_logsReportes_fecha DEFAULT SYSUTCDATETIME(),
+        procedimiento SYSNAME NULL,
+        tipo VARCHAR(30) NOT NULL CHECK (tipo IN ('INFO', 'WARN', 'ERROR')), -- INFO | WARN | ERROR
+        mensaje NVARCHAR(4000) NULL,
+        detalle NVARCHAR(4000) NULL,
+        rutaArchivo NVARCHAR(4000) NULL, -- archivo origen (ej. Excel/CSV)
+		rutaLog NVARCHAR(4000) NULL -- path del archivo de log de texto
 );
 GO

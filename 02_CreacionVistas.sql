@@ -10,10 +10,11 @@ WITH ExpensasConGastos AS (
         E.fechaVto1,
         E.fechaVto2,
         E.montoTotal,
-        -- Sumar los gastos reales (egresos)
         ISNULL(SUM(G.importe), 0) AS totalGastos
     FROM app.Tbl_Expensa E
-    LEFT JOIN app.Tbl_Gasto G ON G.nroExpensa = E.nroExpensa AND G.idConsorcio = E.idConsorcio
+    LEFT JOIN app.Tbl_Gasto G
+           ON G.nroExpensa = E.nroExpensa 
+          AND G.idConsorcio = E.idConsorcio
     GROUP BY E.nroExpensa, E.idConsorcio, E.fechaGeneracion, E.fechaVto1, E.fechaVto2, E.montoTotal
 ),
 PagosPorExpensa AS (
@@ -25,30 +26,70 @@ PagosPorExpensa AS (
         SUM(CASE WHEN P.fecha < E.fechaGeneracion THEN P.monto ELSE 0 END) AS ingresosAdelantados,
         SUM(P.monto) AS totalIngresos
     FROM app.Tbl_Pago P
-    INNER JOIN app.Tbl_Expensa E ON E.nroExpensa = P.nroExpensa AND E.idConsorcio = P.idConsorcio
+    INNER JOIN app.Tbl_Expensa E 
+            ON E.nroExpensa = P.nroExpensa 
+           AND E.idConsorcio = P.idConsorcio
     GROUP BY P.nroExpensa, P.idConsorcio
+),
+Movimientos AS (
+    SELECT 
+        EG.nroExpensa,
+        EG.idConsorcio,
+        EG.fechaGeneracion,
+        EG.fechaVto1,
+        EG.fechaVto2,
+        EG.montoTotal AS montoExpensaTotal,
+        ISNULL(PP.ingresosEnTermino,    0) AS ingresosEnTermino,
+        ISNULL(PP.ingresosAtrasados,    0) AS ingresosAtrasados,
+        ISNULL(PP.ingresosAdelantados,  0) AS ingresosAdelantados,
+        ISNULL(PP.totalIngresos,        0) AS totalIngresos,
+        EG.totalGastos                      AS totalEgresos,
+        CAST(ISNULL(PP.totalIngresos, 0) - EG.totalGastos AS DECIMAL(18,2)) AS deltaNeto
+    FROM ExpensasConGastos EG
+    LEFT JOIN PagosPorExpensa PP 
+           ON PP.nroExpensa = EG.nroExpensa 
+          AND PP.idConsorcio = EG.idConsorcio
+),
+Saldos AS (
+    SELECT
+        ROW_NUMBER() OVER (
+            ORDER BY M.idConsorcio, M.fechaGeneracion, M.nroExpensa
+        ) AS idEstadoFinanciero,
+        M.idConsorcio,
+        M.nroExpensa,
+        M.fechaGeneracion,
+        M.montoExpensaTotal,
+        M.ingresosEnTermino,
+        M.ingresosAtrasados,
+        M.ingresosAdelantados,
+        M.totalIngresos,
+        M.totalEgresos,
+        -- saldoCierre acumulado: suma progresiva por consorcio en orden fecha+nro
+        CAST(SUM(M.deltaNeto) OVER (
+            PARTITION BY M.idConsorcio
+            ORDER BY M.fechaGeneracion, M.nroExpensa
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS DECIMAL(18,2)) AS saldoCierre
+    FROM Movimientos M
 )
 SELECT
-    ROW_NUMBER() OVER (ORDER BY EG.idConsorcio, EG.nroExpensa) AS idEstadoFinanciero,
+    S.idEstadoFinanciero,
     C.idConsorcio,
     C.nombre AS nombreConsorcio,
-    EG.nroExpensa,
-    EG.fechaGeneracion,
-    EG.montoTotal AS montoExpensaTotal,
-    -- Saldo de la expensa anterior
-    LAG(EG.montoTotal, 1, 0) OVER (PARTITION BY EG.idConsorcio ORDER BY EG.nroExpensa) AS saldoAnterior,
-    -- Ingresos (pagos)
-    ISNULL(PP.ingresosEnTermino, 0) AS ingresosEnTermino,
-    ISNULL(PP.ingresosAtrasados, 0) AS ingresosAtrasados,
-    ISNULL(PP.ingresosAdelantados, 0) AS ingresosAdelantados,
-    ISNULL(PP.totalIngresos, 0) AS totalIngresos,
-    -- Egresos (gastos)
-    EG.totalGastos AS totalEgresos,
-    -- Saldo de cierre: saldo anterior + ingresos - egresos
-    LAG(EG.montoTotal, 1, 0) OVER (PARTITION BY EG.idConsorcio ORDER BY EG.nroExpensa) 
-    + ISNULL(PP.totalIngresos, 0) 
-    - EG.totalGastos AS saldoCierre
-FROM ExpensasConGastos EG
-INNER JOIN app.Tbl_Consorcio C ON C.idConsorcio = EG.idConsorcio
-LEFT JOIN PagosPorExpensa PP ON PP.nroExpensa = EG.nroExpensa AND PP.idConsorcio = EG.idConsorcio;
+    S.nroExpensa,
+    S.fechaGeneracion,
+    S.montoExpensaTotal,
+    LAG(S.saldoCierre, 1, 0) OVER (
+        PARTITION BY S.idConsorcio 
+        ORDER BY S.fechaGeneracion, S.nroExpensa
+    ) AS saldoAnterior,
+    S.ingresosEnTermino,
+    S.ingresosAtrasados,
+    S.ingresosAdelantados,
+    S.totalIngresos,
+    S.totalEgresos,
+    S.saldoCierre
+FROM Saldos S
+INNER JOIN app.Tbl_Consorcio C 
+        ON C.idConsorcio = S.idConsorcio;
 GO

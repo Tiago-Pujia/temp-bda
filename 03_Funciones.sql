@@ -100,3 +100,108 @@ BEGIN
     RETURN TRY_CONVERT(DECIMAL(18,2), @u);
 END
 GO
+
+CREATE OR ALTER FUNCTION api.fn_ObtenerCotizacionActual(@TipoDolar VARCHAR(50) = 'blue')
+RETURNS DECIMAL(10,2)
+AS
+BEGIN
+    DECLARE @cot DECIMAL(10,2) = NULL;
+
+    SELECT TOP (1) @cot = valorVenta
+    FROM api.Tbl_CotizacionDolar
+    WHERE tipoDolar = @TipoDolar
+    ORDER BY fechaConsulta DESC;
+
+    -- si no hay dato reciente, devolvé 0 (que el caller decida fallback)
+    RETURN ISNULL(@cot, 0);
+END
+GO
+
+CREATE OR ALTER FUNCTION api.fn_PesosADolares(
+    @Monto DECIMAL(18,2),
+    @TipoDolar VARCHAR(50) = 'blue'
+)
+RETURNS DECIMAL(18,2)
+AS
+BEGIN
+    DECLARE @cot DECIMAL(10,2) = api.fn_ObtenerCotizacionActual(@TipoDolar);
+    RETURN CASE WHEN @cot > 0 THEN @Monto / @cot ELSE NULL END;
+END
+GO
+
+CREATE OR ALTER FUNCTION importacion.fn_EmailValido
+(
+    @Email NVARCHAR(320)
+)
+RETURNS BIT
+AS
+BEGIN
+    -- Normalización mínima (trim y NBSP->espacio)
+    DECLARE @e NVARCHAR(320) = LTRIM(RTRIM(ISNULL(@Email, N'')));
+    SET @e = REPLACE(@e, NCHAR(160), N' ');
+
+    -- Vacío
+    IF @e = N'' RETURN 0;
+
+    -- No espacios ni saltos
+    IF PATINDEX(N'%[' + NCHAR(9) + NCHAR(10) + NCHAR(13) + N' ]%', @e) > 0 RETURN 0;
+
+    -- Punto no primero/último y sin consecutivos
+    IF LEFT(@e,1) = N'.' OR RIGHT(@e,1) = N'.' RETURN 0;
+    IF CHARINDEX(N'..', @e) > 0 RETURN 0;
+
+    -- Exactamente un @
+    DECLARE @at INT = CHARINDEX(N'@', @e);
+    IF @at = 0 OR CHARINDEX(N'@', @e, @at + 1) > 0 RETURN 0;
+
+    -- Longitud total <= 254 (RFC)
+    IF LEN(@e) > 254 RETURN 0;
+
+    -- Partes
+    DECLARE @local  NVARCHAR(320) = SUBSTRING(@e, 1, @at - 1);
+    DECLARE @domain NVARCHAR(320) = SUBSTRING(@e, @at + 1, LEN(@e) - @at);
+
+    -- Longitudes
+    IF LEN(@local)  < 1 OR LEN(@local)  > 64  RETURN 0;
+    IF LEN(@domain) < 1 OR LEN(@domain) > 255 RETURN 0;
+
+    -- Local-part: sólo A-Za-z0-9._+-
+    IF PATINDEX(N'%[^-0-9A-Za-z._+]%', @local COLLATE Latin1_General_BIN2) > 0 RETURN 0;
+    IF LEFT(@local,1) = N'.' OR RIGHT(@local,1) = N'.' RETURN 0;
+    IF CHARINDEX(N'..', @local) > 0 RETURN 0;
+
+    -- Dominio: debe tener al menos un punto
+    IF CHARINDEX(N'.', @domain) = 0 RETURN 0;
+
+    -- Dominio: sólo A-Za-z0-9.-
+    IF PATINDEX(N'%[^-0-9A-Za-z.]%', @domain COLLATE Latin1_General_BIN2) > 0 RETURN 0;
+
+    -- Dominio: no empieza/termina con . o -
+    IF LEFT(@domain,1) IN (N'.', N'-') OR RIGHT(@domain,1) IN (N'.', N'-') RETURN 0;
+
+    -- Dominio: sin .. ni .- ni -.
+    IF CHARINDEX(N'..', @domain) > 0 OR CHARINDEX(N'.-', @domain) > 0 OR CHARINDEX(N'-.', @domain) > 0 RETURN 0;
+
+    -- Cada etiqueta <= 63 y sin guión al inicio/fin
+    DECLARE @pos INT = 1, @next INT, @label NVARCHAR(63);
+    WHILE @pos <= LEN(@domain) + 1
+    BEGIN
+        SET @next = CHARINDEX(N'.', @domain, @pos);
+        IF @next = 0 SET @next = LEN(@domain) + 1;
+
+        SET @label = SUBSTRING(@domain, @pos, @next - @pos);
+        IF LEN(@label) < 1 OR LEN(@label) > 63 RETURN 0;
+        IF LEFT(@label,1) = N'-' OR RIGHT(@label,1) = N'-' RETURN 0;
+
+        SET @pos = @next + 1;
+    END
+
+    -- TLD: sólo letras, largo 2–24
+    DECLARE @lastDot INT = LEN(@domain) - CHARINDEX(N'.', REVERSE(@domain)) + 1;
+    DECLARE @tld NVARCHAR(24) = SUBSTRING(@domain, @lastDot + 1, LEN(@domain) - @lastDot);
+    IF LEN(@tld) < 2 OR LEN(@tld) > 24 RETURN 0;
+    IF PATINDEX(N'%[^A-Za-z]%', @tld COLLATE Latin1_General_BIN2) > 0 RETURN 0;
+
+    RETURN 1;
+END
+GO
