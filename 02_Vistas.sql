@@ -93,3 +93,15 @@ FROM Saldos S
 INNER JOIN app.Tbl_Consorcio C 
         ON C.idConsorcio = S.idConsorcio;
 GO
+
+CREATE OR ALTER VIEW app.Vw_PersonaSegura
+AS
+SELECT
+    p.idPersona,
+    p.nombre,
+    p.apellido,
+    p.dni       AS dni,
+    p.email     AS email,
+    p.telefono  AS telefono
+FROM app.Tbl_Persona p;
+GO

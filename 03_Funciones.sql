@@ -205,3 +205,24 @@ BEGIN
     RETURN 1;
 END
 GO
+
+CREATE OR ALTER FUNCTION seguridad.fn_EncriptarTexto(@texto NVARCHAR(4000))
+RETURNS VARBINARY(512)
+AS
+BEGIN
+    IF @texto IS NULL RETURN NULL;
+
+    RETURN ENCRYPTBYPASSPHRASE(N'Consorcio-2025-ClaveSecreta', @texto);
+END;
+GO
+
+CREATE OR ALTER FUNCTION seguridad.fn_DesencriptarTexto(@dato VARBINARY(512))
+RETURNS NVARCHAR(4000)
+AS
+BEGIN
+    IF @dato IS NULL RETURN NULL;
+
+    RETURN CONVERT(NVARCHAR(4000),
+                   DECRYPTBYPASSPHRASE(N'Consorcio-2025-ClaveSecreta', @dato));
+END;
+GO
