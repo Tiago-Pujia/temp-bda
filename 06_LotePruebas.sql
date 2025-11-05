@@ -1,17 +1,3 @@
-/*
-    TODO: COMPLETAR CON DATOS DEL GRUPO
-    Trabajo Práctico Integrador - Bases de Datos Aplicada (3641)
-    Comisión: Com5600
-    Grupo: G13
-    Archivo: 50_CargaDatosPrueba_Expensas.sql
-    Enunciado: Carga del lote de datos de prueba para expensas (consorcios, UF, gastos, estados de cuenta y pagos).
-    Fecha de entrega: YYYY-MM-DD
-    Integrantes:
-        - Apellido, Nombre - DNI
-        - Apellido, Nombre - DNI
-        ...
-*/
-
 USE Com5600G13;
 GO
 
@@ -66,7 +52,7 @@ WHERE nombre = 'CONSORCIO_TEST_4_SOLO_COCHERA';
 
 
 /* =========================================================
-   2. PERSONAS Y RELACIÓN CON CONSORCIOS (PROPIETARIOS / INQUILINOS)
+   2. PERSONAS Y RELACIï¿½N CON CONSORCIOS (PROPIETARIOS / INQUILINOS)
    ========================================================= */
 
 DECLARE @idPerJose   INT;
@@ -76,7 +62,7 @@ DECLARE @idPerAna    INT;
 DECLARE @idPerLucia  INT;
 DECLARE @idPerDiego  INT;
 
--- José Gimenez - propietario consorcio 1 (con email)
+-- Josï¿½ Gimenez - propietario consorcio 1 (con email)
 IF NOT EXISTS (SELECT 1 FROM app.Tbl_Persona WHERE dni = 10000001)
 BEGIN
     INSERT INTO app.Tbl_Persona (nombre, apellido, dni, email, telefono, CBU_CVU)
@@ -124,7 +110,7 @@ BEGIN
 END;
 SELECT @idPerDiego = idPersona FROM app.Tbl_Persona WHERE dni = 10000006;
 
--- Relación UFPersona (a nivel consorcio)
+-- Relaciï¿½n UFPersona (a nivel consorcio)
 IF NOT EXISTS (SELECT 1 FROM app.Tbl_UFPersona WHERE idPersona = @idPerJose)
 BEGIN
     INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino, fechaInicio, fechaFin)
@@ -314,8 +300,8 @@ BEGIN
     VALUES (@idGasto, 'Banco Prueba S.A.', 'Mantenimiento Cuenta', 'FAC-BCO-EN-2025-0001');
 END;
 
--- 2) Limpieza - Opción 1: sueldo + productos
--- 2.a) Sueldo empleado servicio doméstico
+-- 2) Limpieza - Opciï¿½n 1: sueldo + productos
+-- 2.a) Sueldo empleado servicio domï¿½stico
 SELECT @idGasto = idGasto
 FROM app.Tbl_Gasto
 WHERE idConsorcio = @idConsFullBC AND nroExpensa = @ExpEne2025_C1
@@ -355,24 +341,24 @@ BEGIN
     VALUES (@idGasto, 'Limpio S.R.L.', 'Limpieza - Productos', 'FAC-LIMP-EN-2025-0001');
 END;
 
--- 3) Honorarios administración
+-- 3) Honorarios administraciï¿½n
 SELECT @idGasto = idGasto
 FROM app.Tbl_Gasto
 WHERE idConsorcio = @idConsFullBC AND nroExpensa = @ExpEne2025_C1
-  AND descripcion = 'Honorarios administración - Enero 2025';
+  AND descripcion = 'Honorarios administraciï¿½n - Enero 2025';
 
 IF @idGasto IS NULL
 BEGIN
     INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
     VALUES (@ExpEne2025_C1, @idConsFullBC, 'Ordinario',
-            'Honorarios administración - Enero 2025', '2025-01-04', 60000.00);
+            'Honorarios administraciï¿½n - Enero 2025', '2025-01-04', 60000.00);
     SET @idGasto = SCOPE_IDENTITY();
 END;
 
 IF NOT EXISTS (SELECT 1 FROM app.Tbl_Gasto_Ordinario WHERE idGasto = @idGasto)
 BEGIN
     INSERT INTO app.Tbl_Gasto_Ordinario (idGasto, nombreProveedor, categoria, nroFactura)
-    VALUES (@idGasto, 'Administración Altos SJ', 'Honorarios', 'FAC-ADM-EN-2025-0001');
+    VALUES (@idGasto, 'Administraciï¿½n Altos SJ', 'Honorarios', 'FAC-ADM-EN-2025-0001');
 END;
 
 -- 4) Seguros
@@ -395,17 +381,17 @@ BEGIN
     VALUES (@idGasto, 'Seguros Unidos S.A.', 'Seguros', 'FAC-SEG-EN-2025-0001');
 END;
 
--- 5) Gastos generales (ej: fumigación, limpieza de tanques)
+-- 5) Gastos generales (ej: fumigaciï¿½n, limpieza de tanques)
 SELECT @idGasto = idGasto
 FROM app.Tbl_Gasto
 WHERE idConsorcio = @idConsFullBC AND nroExpensa = @ExpEne2025_C1
-  AND descripcion = 'Fumigación mensual - Enero 2025';
+  AND descripcion = 'Fumigaciï¿½n mensual - Enero 2025';
 
 IF @idGasto IS NULL
 BEGIN
     INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
     VALUES (@ExpEne2025_C1, @idConsFullBC, 'Ordinario',
-            'Fumigación mensual - Enero 2025', '2025-01-06', 10000.00);
+            'Fumigaciï¿½n mensual - Enero 2025', '2025-01-06', 10000.00);
     SET @idGasto = SCOPE_IDENTITY();
 END;
 
@@ -434,7 +420,7 @@ BEGIN
     VALUES (@idGasto, 'Agua Limpia S.A.', 'Gastos Generales', 'FAC-TAN-EN-2025-0001');
 END;
 
--- 6) Servicios públicos: Luz, Agua, Internet
+-- 6) Servicios pï¿½blicos: Luz, Agua, Internet
 -- Luz
 SELECT @idGasto = idGasto
 FROM app.Tbl_Gasto
@@ -452,7 +438,7 @@ END;
 IF NOT EXISTS (SELECT 1 FROM app.Tbl_Gasto_Ordinario WHERE idGasto = @idGasto)
 BEGIN
     INSERT INTO app.Tbl_Gasto_Ordinario (idGasto, nombreProveedor, categoria, nroFactura)
-    VALUES (@idGasto, 'Edesur', 'Servicios Públicos - Luz', 'FAC-LUZ-EN-2025-0001');
+    VALUES (@idGasto, 'Edesur', 'Servicios Pï¿½blicos - Luz', 'FAC-LUZ-EN-2025-0001');
 END;
 
 -- Agua
@@ -472,7 +458,7 @@ END;
 IF NOT EXISTS (SELECT 1 FROM app.Tbl_Gasto_Ordinario WHERE idGasto = @idGasto)
 BEGIN
     INSERT INTO app.Tbl_Gasto_Ordinario (idGasto, nombreProveedor, categoria, nroFactura)
-    VALUES (@idGasto, 'AySA', 'Servicios Públicos - Agua', 'FAC-AGUA-EN-2025-0001');
+    VALUES (@idGasto, 'AySA', 'Servicios Pï¿½blicos - Agua', 'FAC-AGUA-EN-2025-0001');
 END;
 
 -- Internet (solo si el consorcio la tiene configurada)
@@ -492,13 +478,13 @@ END;
 IF NOT EXISTS (SELECT 1 FROM app.Tbl_Gasto_Ordinario WHERE idGasto = @idGasto)
 BEGIN
     INSERT INTO app.Tbl_Gasto_Ordinario (idGasto, nombreProveedor, categoria, nroFactura)
-    VALUES (@idGasto, 'FibraMax', 'Servicios Públicos - Internet', 'FAC-INT-EN-2025-0001');
+    VALUES (@idGasto, 'FibraMax', 'Servicios Pï¿½blicos - Internet', 'FAC-INT-EN-2025-0001');
 END;
 
 
--- ========== FEBRERO 2025: GASTOS ORDINARIOS (ejemplo con Opción 2 para limpieza) ==========
+-- ========== FEBRERO 2025: GASTOS ORDINARIOS (ejemplo con Opciï¿½n 2 para limpieza) ==========
 
--- Limpieza Opción 2: Empresa de limpieza (un solo gasto)
+-- Limpieza Opciï¿½n 2: Empresa de limpieza (un solo gasto)
 SELECT @idGasto = idGasto
 FROM app.Tbl_Gasto
 WHERE idConsorcio = @idConsFullBC AND nroExpensa = @ExpFeb2025_C1
@@ -518,22 +504,22 @@ BEGIN
     VALUES (@idGasto, 'CleanCorp S.A.', 'Limpieza - Empresa', 'FAC-LIMP-FE-2025-0001');
 END;
 
--- (Podés agregar más gastos de febrero si querés más volumen, misma lógica que enero)
+-- (Podï¿½s agregar mï¿½s gastos de febrero si querï¿½s mï¿½s volumen, misma lï¿½gica que enero)
 
 
 -- ========== MARZO 2025: GASTOS ORDINARIOS + EXTRAORDINARIOS ==========
 
--- Ejemplo de gasto extraordinario: reparación de fachada, en 3 cuotas (2/3)
+-- Ejemplo de gasto extraordinario: reparaciï¿½n de fachada, en 3 cuotas (2/3)
 SELECT @idGasto = idGasto
 FROM app.Tbl_Gasto
 WHERE idConsorcio = @idConsFullBC AND nroExpensa = @ExpMar2025_C1
-  AND descripcion = 'Reparación de fachada - cuota 2/3';
+  AND descripcion = 'Reparaciï¿½n de fachada - cuota 2/3';
 
 IF @idGasto IS NULL
 BEGIN
     INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
     VALUES (@ExpMar2025_C1, @idConsFullBC, 'Extraordinario',
-            'Reparación de fachada - cuota 2/3', '2025-03-05', 200000.00);
+            'Reparaciï¿½n de fachada - cuota 2/3', '2025-03-05', 200000.00);
     SET @idGasto = SCOPE_IDENTITY();
 END;
 
@@ -543,17 +529,17 @@ BEGIN
     VALUES (@idGasto, 2, 3);
 END;
 
--- Otro gasto extraordinario: construcción de parrilla - pago único
+-- Otro gasto extraordinario: construcciï¿½n de parrilla - pago ï¿½nico
 SELECT @idGasto = idGasto
 FROM app.Tbl_Gasto
 WHERE idConsorcio = @idConsFullBC AND nroExpensa = @ExpMar2025_C1
-  AND descripcion = 'Construcción parrilla SUM - pago único';
+  AND descripcion = 'Construcciï¿½n parrilla SUM - pago ï¿½nico';
 
 IF @idGasto IS NULL
 BEGIN
     INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
     VALUES (@ExpMar2025_C1, @idConsFullBC, 'Extraordinario',
-            'Construcción parrilla SUM - pago único', '2025-03-06', 120000.00);
+            'Construcciï¿½n parrilla SUM - pago ï¿½nico', '2025-03-06', 120000.00);
     SET @idGasto = SCOPE_IDENTITY();
 END;
 
@@ -568,7 +554,7 @@ END;
    6. ESTADO DE CUENTA (3 meses) PARA LAS 10 UF DEL CONSORCIO 1
    ========================================================= */
 
--- Enero 2025: saldo inicial, sin pagos aún, sin mora
+-- Enero 2025: saldo inicial, sin pagos aï¿½n, sin mora
 INSERT INTO app.Tbl_EstadoCuenta (
     nroUnidadFuncional, idConsorcio, nroExpensa,
     saldoAnterior, pagoRecibido, deuda, interesMora,
@@ -653,7 +639,7 @@ WHERE UF.idConsorcio = @idConsFullBC
    7. PAGOS ASOCIADOS (Tbl_Pago) PARA PROBAR FLUJO DE CAJA
    ========================================================= */
 
--- Pago en término: UF PB-A, Febrero (antes del 1er vto 2025-02-15)
+-- Pago en tï¿½rmino: UF PB-A, Febrero (antes del 1er vto 2025-02-15)
 INSERT INTO app.Tbl_Pago (idEstadoCuenta, nroUnidadFuncional, idConsorcio, nroExpensa, fecha, monto, CBU_CVU)
 SELECT
     EC.idEstadoCuenta,
@@ -726,11 +712,11 @@ WHERE EC.idConsorcio = @idConsFullBC
   );
 
 /*
-   Hasta acá:
+   Hasta acï¿½:
    - 4 consorcios con las combinaciones pedidas (baulera / cochera / ninguna / una sola).
    - 10 UF por consorcio (>=10) con % y superficies.
    - 3 meses de expensas para consorcio 1, uno con gastos extraordinarios.
-   - Estados de cuenta y pagos con casos de interés 0%, 2% y 5%.
+   - Estados de cuenta y pagos con casos de interï¿½s 0%, 2% y 5%.
    - Este script es re-ejecutable sin duplicar datos (usa IF NOT EXISTS / NOT EXISTS).
 */
 GO

@@ -1,11 +1,13 @@
 /*
 tablas -> Tbl_[NombreTabla] -> ejemplo: Tbl_Usuario
+campos -> [nombreCampo] -> ejemplo: idUsuario
 vistas -> Vw_[NombreVista]
 procedimientos almacenados -> Sp_[NombreProcedimiento]
-
-
-campos -> [nombreCampo] -> ejemplo: idUsuario
-primary Key -> [NombreTabla] -> ejemplo: Usuario
+indices -> IDX_[NombreIndice] -> ejemplo: IDX_Usuario_Email
+funciones -> fn_[NombreFuncion]
+esquemas -> [nombreEsquema] -> ejemplo: app, importacion, report
+rol -> [rol_nombreRol] -> ejemplo: rol_Admin
+usuarios -> [usr_nombreUsuario] -> ejemplo: usr_app
 */
 
 USE MASTER
@@ -49,6 +51,7 @@ IF OBJECT_ID(N'app.Tbl_Consorcio', N'U') IS NOT NULL DROP TABLE app.Tbl_Consorci
 IF OBJECT_ID(N'app.Tbl_Persona', N'U') IS NOT NULL DROP TABLE app.Tbl_Persona;
 IF OBJECT_ID(N'api.Tbl_CotizacionDolar', N'U') IS NOT NULL DROP TABLE api.Tbl_CotizacionDolar;
 IF OBJECT_ID(N'reportes.logsReportes', N'U') IS NOT NULL DROP TABLE reportes.logsReportes;
+IF OBJECT_ID(N'app.Tbl_Feriado', N'U') IS NOT NULL DROP TABLE app.Tbl_Feriado;
 GO
 
 /* ---- Tbl_Persona ---- */
@@ -239,3 +242,8 @@ CREATE TABLE reportes.logsReportes
 		rutaLog NVARCHAR(4000) NULL -- path del archivo de log de texto
 );
 GO
+
+/** ---- Tbl_Feriado ---- **/
+CREATE TABLE app.Tbl_Feriado (
+    fecha DATE NOT NULL PRIMARY KEY
+);

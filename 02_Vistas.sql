@@ -94,6 +94,7 @@ INNER JOIN app.Tbl_Consorcio C
         ON C.idConsorcio = S.idConsorcio;
 GO
 
+
 CREATE OR ALTER VIEW app.Vw_PersonaSegura
 AS
 SELECT

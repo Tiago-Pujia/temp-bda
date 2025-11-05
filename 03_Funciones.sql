@@ -1,7 +1,7 @@
 USE Com5600G13;
 GO
 
--- Función: limpia espacios a los costados y recorta a largo máximo.
+/** Funcion: limpia espacios a los costados y recorta a largo maximo. **/
 CREATE OR ALTER FUNCTION importacion.fn_LimpiarTexto
 (
     @texto   NVARCHAR(MAX),
@@ -21,7 +21,7 @@ BEGIN
 END
 GO
 
--- Función: convierte texto a DECIMAL(10,2), acepta coma o punto.
+/** Convierte texto a DECIMAL(10,2), acepta coma o punto. **/
 CREATE OR ALTER FUNCTION importacion.fn_A_Decimal
 (
     @texto NVARCHAR(200)
@@ -43,6 +43,7 @@ BEGIN
 END
 GO
 
+/** Devuelve el importe en el formato correcto **/
 CREATE OR ALTER FUNCTION importacion.fn_ParseImporteFlexible (@s NVARCHAR(100))
 RETURNS DECIMAL(18,2)
 AS
@@ -72,7 +73,7 @@ BEGIN
 
     -- 5) Fallback:
     --    a) Dejar solo 0-9 . , - 
-    --    b) Decidir separador decimal como el último (.,) que aparezca
+    --    b) Decidir separador decimal como el ï¿½ltimo (.,) que aparezca
     DECLARE @u NVARCHAR(100) = N'';
     DECLARE @i INT = 1, @c NCHAR(1);
 
@@ -84,7 +85,7 @@ BEGIN
         SET @i += 1;
     END
 
-    -- Posición desde el final (el último que aparezca)
+    -- Posiciï¿½n desde el final (el ï¿½ltimo que aparezca)
     DECLARE @pDot INT = NULLIF(CHARINDEX(N'.', REVERSE(@u)), 0);
     DECLARE @pCom INT = NULLIF(CHARINDEX(N',', REVERSE(@u)), 0);
     DECLARE @sep  NCHAR(1) =
@@ -101,6 +102,7 @@ BEGIN
 END
 GO
 
+/** Obtiene la cotizaciÃ³n de Tbl_CotizacionDolar **/
 CREATE OR ALTER FUNCTION api.fn_ObtenerCotizacionActual(@TipoDolar VARCHAR(50) = 'blue')
 RETURNS DECIMAL(10,2)
 AS
@@ -112,11 +114,12 @@ BEGIN
     WHERE tipoDolar = @TipoDolar
     ORDER BY fechaConsulta DESC;
 
-    -- si no hay dato reciente, devolvé 0 (que el caller decida fallback)
+    -- si no hay dato reciente, devolvï¿½ 0 (que el caller decida fallback)
     RETURN ISNULL(@cot, 0);
 END
 GO
 
+/** Transforma los pesos a dolares **/
 CREATE OR ALTER FUNCTION api.fn_PesosADolares(
     @Monto DECIMAL(18,2),
     @TipoDolar VARCHAR(50) = 'blue'
@@ -129,6 +132,7 @@ BEGIN
 END
 GO
 
+/** Verifica que un email es valido **/
 CREATE OR ALTER FUNCTION importacion.fn_EmailValido
 (
     @Email NVARCHAR(320)
@@ -136,17 +140,17 @@ CREATE OR ALTER FUNCTION importacion.fn_EmailValido
 RETURNS BIT
 AS
 BEGIN
-    -- Normalización mínima (trim y NBSP->espacio)
+    -- Normalizaciï¿½n mï¿½nima (trim y NBSP->espacio)
     DECLARE @e NVARCHAR(320) = LTRIM(RTRIM(ISNULL(@Email, N'')));
     SET @e = REPLACE(@e, NCHAR(160), N' ');
 
-    -- Vacío
+    -- Vacï¿½o
     IF @e = N'' RETURN 0;
 
     -- No espacios ni saltos
     IF PATINDEX(N'%[' + NCHAR(9) + NCHAR(10) + NCHAR(13) + N' ]%', @e) > 0 RETURN 0;
 
-    -- Punto no primero/último y sin consecutivos
+    -- Punto no primero/ï¿½ltimo y sin consecutivos
     IF LEFT(@e,1) = N'.' OR RIGHT(@e,1) = N'.' RETURN 0;
     IF CHARINDEX(N'..', @e) > 0 RETURN 0;
 
@@ -165,7 +169,7 @@ BEGIN
     IF LEN(@local)  < 1 OR LEN(@local)  > 64  RETURN 0;
     IF LEN(@domain) < 1 OR LEN(@domain) > 255 RETURN 0;
 
-    -- Local-part: sólo A-Za-z0-9._+-
+    -- Local-part: sï¿½lo A-Za-z0-9._+-
     IF PATINDEX(N'%[^-0-9A-Za-z._+]%', @local COLLATE Latin1_General_BIN2) > 0 RETURN 0;
     IF LEFT(@local,1) = N'.' OR RIGHT(@local,1) = N'.' RETURN 0;
     IF CHARINDEX(N'..', @local) > 0 RETURN 0;
@@ -173,7 +177,7 @@ BEGIN
     -- Dominio: debe tener al menos un punto
     IF CHARINDEX(N'.', @domain) = 0 RETURN 0;
 
-    -- Dominio: sólo A-Za-z0-9.-
+    -- Dominio: sï¿½lo A-Za-z0-9.-
     IF PATINDEX(N'%[^-0-9A-Za-z.]%', @domain COLLATE Latin1_General_BIN2) > 0 RETURN 0;
 
     -- Dominio: no empieza/termina con . o -
@@ -182,7 +186,7 @@ BEGIN
     -- Dominio: sin .. ni .- ni -.
     IF CHARINDEX(N'..', @domain) > 0 OR CHARINDEX(N'.-', @domain) > 0 OR CHARINDEX(N'-.', @domain) > 0 RETURN 0;
 
-    -- Cada etiqueta <= 63 y sin guión al inicio/fin
+    -- Cada etiqueta <= 63 y sin guiï¿½n al inicio/fin
     DECLARE @pos INT = 1, @next INT, @label NVARCHAR(63);
     WHILE @pos <= LEN(@domain) + 1
     BEGIN
@@ -196,7 +200,7 @@ BEGIN
         SET @pos = @next + 1;
     END
 
-    -- TLD: sólo letras, largo 2–24
+    -- TLD: sï¿½lo letras, largo 2ï¿½24
     DECLARE @lastDot INT = LEN(@domain) - CHARINDEX(N'.', REVERSE(@domain)) + 1;
     DECLARE @tld NVARCHAR(24) = SUBSTRING(@domain, @lastDot + 1, LEN(@domain) - @lastDot);
     IF LEN(@tld) < 2 OR LEN(@tld) > 24 RETURN 0;
@@ -206,23 +210,22 @@ BEGIN
 END
 GO
 
+/** Encripta un texto y retorna un alfanumerico **/
 CREATE OR ALTER FUNCTION seguridad.fn_EncriptarTexto(@texto NVARCHAR(4000))
 RETURNS VARBINARY(512)
 AS
 BEGIN
     IF @texto IS NULL RETURN NULL;
-
-    RETURN ENCRYPTBYPASSPHRASE(N'Consorcio-2025-ClaveSecreta', @texto);
 END;
 GO
 
+/**Descripta un alfanumerico y retorna un texto  **/
 CREATE OR ALTER FUNCTION seguridad.fn_DesencriptarTexto(@dato VARBINARY(512))
 RETURNS NVARCHAR(4000)
 AS
 BEGIN
     IF @dato IS NULL RETURN NULL;
 
-    RETURN CONVERT(NVARCHAR(4000),
-                   DECRYPTBYPASSPHRASE(N'Consorcio-2025-ClaveSecreta', @dato));
+    RETURN CONVERT(NVARCHAR(4000), DECRYPTBYPASSPHRASE(N'Consorcio-2025-ClaveSecreta', @dato));
 END;
 GO
