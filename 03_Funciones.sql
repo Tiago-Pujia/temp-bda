@@ -48,57 +48,64 @@ CREATE OR ALTER FUNCTION importacion.fn_ParseImporteFlexible (@s NVARCHAR(100))
 RETURNS DECIMAL(18,2)
 AS
 BEGIN
-    -- 0) Atajos
-    IF @s IS NULL OR LTRIM(RTRIM(@s)) = N'' 
-        RETURN NULL;
+    IF @s IS NULL OR LTRIM(RTRIM(@s)) = N'' RETURN NULL;
 
-    DECLARE @t NVARCHAR(100);
-
-    -- 1) Normalizar: sacar NBSP, 'ARS', '$', espacios y tabs
-    SET @t = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@s, CHAR(160), ' '), N'ARS', N''), N'$', N''), N' ', N''), CHAR(9), N'');
+    -- 1) Normalizar: quitar NBSP, ARS, $, espacios y tabs
+    DECLARE @t NVARCHAR(100) =
+        REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@s, CHAR(160), ' ')
+             , N'ARS', N''), N'$', N''), N' ', N''), CHAR(9), N'');
 
     -- 2) Negativos tipo (123,45) => -123,45
-    IF LEFT(@t,1) = N'(' AND RIGHT(@t,1) = N')'
-        SET @t = N'-' + SUBSTRING(@t, 2, LEN(@t)-2);
+    IF LEFT(@t,1)=N'(' AND RIGHT(@t,1)=N')'
+        SET @t = N'-' + SUBSTRING(@t,2,LEN(@t)-2);
 
-    DECLARE @res DECIMAL(18,2);
-
-    -- 3) Estilo US: quitar separadores de miles (,) y castear
-    SET @res = TRY_CONVERT(DECIMAL(18,2), REPLACE(@t, N',', N''));
-    IF @res IS NOT NULL RETURN @res;
-
-    -- 4) Estilo EU: quitar miles (.) y cambiar decimal (,) -> (.)
-    SET @res = TRY_CONVERT(DECIMAL(18,2), REPLACE(REPLACE(@t, N'.', N''), N',', N'.'));
-    IF @res IS NOT NULL RETURN @res;
-
-    -- 5) Fallback:
-    --    a) Dejar solo 0-9 . , - 
-    --    b) Decidir separador decimal como el �ltimo (.,) que aparezca
+    -- 3) Dejar solo dígitos, separadores y signo
     DECLARE @u NVARCHAR(100) = N'';
     DECLARE @i INT = 1, @c NCHAR(1);
-
     WHILE @i <= LEN(@t)
     BEGIN
-        SET @c = SUBSTRING(@t, @i, 1);
-        IF @c LIKE N'[0-9]' OR @c IN (N'.', N',', N'-')
-            SET @u = @u + @c;
+        SET @c = SUBSTRING(@t,@i,1);
+        IF (@c LIKE N'[0-9]') OR (@c IN (N'.',N',',N'-'))
+            SET @u += @c;
         SET @i += 1;
     END
+    IF @u = N'' RETURN NULL;
 
-    -- Posici�n desde el final (el �ltimo que aparezca)
+    -- 4) Manejo de signo
+    DECLARE @sign NVARCHAR(1) = CASE WHEN LEFT(@u,1)='-' THEN '-' ELSE '' END;
+    IF @sign='-' SET @u = SUBSTRING(@u,2,LEN(@u));
+    SET @u = REPLACE(@u, N'-', N''); -- quitar guiones restantes
+
+    -- 5) Elegir SIEMPRE el último separador (.,) como decimal
     DECLARE @pDot INT = NULLIF(CHARINDEX(N'.', REVERSE(@u)), 0);
     DECLARE @pCom INT = NULLIF(CHARINDEX(N',', REVERSE(@u)), 0);
-    DECLARE @sep  NCHAR(1) =
-        CASE WHEN @pDot IS NOT NULL AND (@pCom IS NULL OR @pDot < @pCom) THEN N'.'
-             WHEN @pCom IS NOT NULL THEN N',' 
-             ELSE N'.' END;
 
-    IF @sep = N'.'
-        SET @u = REPLACE(@u, N',', N'');               -- miles = ,  -> eliminar
-    ELSE
-        SET @u = REPLACE(REPLACE(@u, N'.', N''), N',', N'.'); -- miles = . ; decimal = , -> .
+    -- Si no hay separador: quitar todos y castear
+    IF @pDot IS NULL AND @pCom IS NULL
+    BEGIN
+        SET @u = REPLACE(REPLACE(@u, N'.', N''), N',', N'');
+        RETURN TRY_CONVERT(DECIMAL(18,2), @sign + @u);
+    END
 
-    RETURN TRY_CONVERT(DECIMAL(18,2), @u);
+    -- Separador = el que esté más a la derecha en la cadena original
+    DECLARE @sep NCHAR(1) =
+        CASE WHEN @pDot IS NOT NULL AND (@pCom IS NULL OR @pDot < @pCom) THEN N'.' ELSE N',' END;
+
+    -- Posición del separador en la cadena original (desde el inicio)
+    DECLARE @pos INT = LEN(@u) - CASE WHEN @sep='.' THEN @pDot ELSE @pCom END + 1;
+
+    DECLARE @left  NVARCHAR(100) = SUBSTRING(@u, 1, @pos-1);
+    DECLARE @right NVARCHAR(100) = SUBSTRING(@u, @pos+1, LEN(@u));
+
+    -- Quitar miles en ambos lados
+    SET @left  = REPLACE(REPLACE(@left,  N'.', N''), N',', N'');
+    SET @right = REPLACE(REPLACE(@right, N'.', N''), N',', N'');
+
+    -- Armar número normalizado con punto decimal
+    DECLARE @normalized NVARCHAR(202) =
+        @sign + CASE WHEN @left = '' THEN '0' ELSE @left END + N'.' + @right;
+
+    RETURN TRY_CONVERT(DECIMAL(18,2), @normalized);
 END
 GO
 
@@ -210,12 +217,78 @@ BEGIN
 END
 GO
 
+/** Normalizar email **/
+CREATE OR ALTER FUNCTION importacion.fn_NormalizarEmail
+(
+    @Email NVARCHAR(320)
+)
+RETURNS NVARCHAR(320)
+AS
+BEGIN
+    DECLARE @e NVARCHAR(320) = LTRIM(RTRIM(ISNULL(@Email, N'')));
+
+    -- NBSP -> espacio
+    SET @e = REPLACE(@e, NCHAR(160), N' ');
+
+    -- Todo a minúsculas
+    SET @e = LOWER(@e);
+
+    -- Sacar tabs y saltos (dejar solo espacios comunes)
+    SET @e = REPLACE(@e, CHAR(9),  N'');
+    SET @e = REPLACE(@e, CHAR(10), N'');
+    SET @e = REPLACE(@e, CHAR(13), N'');
+
+    -- Reemplazar comas y punto y coma por punto (gmail,com -> gmail.com)
+    SET @e = REPLACE(@e, N',', N'.');
+    SET @e = REPLACE(@e, N';', N'.');
+
+    -- Quitar espacios alrededor del @ ( "pepe @ gmail.com" -> "pepe@gmail.com" )
+    SET @e = REPLACE(@e, N' @ ', N'@');
+    SET @e = REPLACE(@e, N' @',  N'@');
+    SET @e = REPLACE(@e, N'@ ',  N'@');
+
+    -- Quitar espacios en el resto (pepe gmail.com -> pepegmail.com, después reparamos dominios típicos)
+    SET @e = REPLACE(@e, N' ', N'');
+
+    ----------------------------------------------------------------
+    -- Correcciones de dominios típicos mal escritos
+    ----------------------------------------------------------------
+    -- gmail com / hotmail com / outlook com / yahoo com -> .com
+    SET @e = REPLACE(@e, N'gmailcom',   N'gmail.com');
+    SET @e = REPLACE(@e, N'hotmailcom', N'hotmail.com');
+    SET @e = REPLACE(@e, N'outlookcom', N'outlook.com');
+    SET @e = REPLACE(@e, N'yahoocom',   N'yahoo.com');
+    SET @e = REPLACE(@e, N'livecom',    N'live.com');
+
+    -- Variantes con "con" o "vom" (errores de tipeo comunes)
+    SET @e = REPLACE(@e, N'gmailcon',   N'gmail.com');
+    SET @e = REPLACE(@e, N'gmailvom',   N'gmail.com');
+
+    -- gmail.com ar -> gmail.com.ar
+    SET @e = REPLACE(@e, N'gmail.comar', N'gmail.com.ar');
+    SET @e = REPLACE(@e, N'hotmail.comar', N'hotmail.com.ar');
+    SET @e = REPLACE(@e, N'outlook.comar', N'outlook.com.ar');
+
+    -- Variantes " arroba " / "(at)" por si aparecen
+    SET @e = REPLACE(@e, N'(at)', N'@');
+    SET @e = REPLACE(@e, N' arroba ', N'@');
+    SET @e = REPLACE(@e, N' arroba',  N'@');
+    SET @e = REPLACE(@e, N'arroba ',  N'@');
+
+    RETURN LTRIM(RTRIM(@e));
+END;
+GO
+
 /** Encripta un texto y retorna un alfanumerico **/
 CREATE OR ALTER FUNCTION seguridad.fn_EncriptarTexto(@texto NVARCHAR(4000))
 RETURNS VARBINARY(512)
 AS
 BEGIN
-    IF @texto IS NULL RETURN NULL;
+    RETURN
+        CASE 
+            WHEN @texto IS NULL THEN NULL
+            ELSE CONVERT(VARBINARY(512), @texto)
+        END;
 END;
 GO
 
