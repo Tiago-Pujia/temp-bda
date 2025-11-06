@@ -190,898 +190,6 @@ FROM OPENROWSET(
 END
 GO
 -- //////////////////////////////////////////////////////////////////////
-CREATE OR ALTER PROCEDURE importacion.Sp_CargarGastosDesdeExcel
-    @RutaArchivo       NVARCHAR(4000),            -- ej: C:\...\datos varios.xlsx
-    @Hoja              NVARCHAR(128) = N'Proveedores$', -- hoja de Excel
-    @UsarFechaExpensa  DATE = '19000101',         -- fecha de expensa a usar/crear
-    @LogPath           NVARCHAR(4000) = NULL,     -- opcional: archivo .log
-    @Verbose           BIT = 0                    -- 1 = logs INFO
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @Procedimiento SYSNAME = N'importacion.Sp_CargarGastosDesdeExcel';
-
-    BEGIN TRY
-        IF @Verbose = 1
-            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Inicio de proceso', NULL, @RutaArchivo, @LogPath;
-
-        -- 1) Normalizo hoja y proveedor de Excel (HDR=NO porque leemos B3:E...)
-        DECLARE @HojaOk NVARCHAR(128) = CASE WHEN RIGHT(ISNULL(@Hoja,N''),1)=N'$' THEN @Hoja ELSE @Hoja + N'$' END;
-
-        IF OBJECT_ID('tempdb..#ExcelCrudo') IS NOT NULL DROP TABLE #ExcelCrudo;
-        CREATE TABLE #ExcelCrudo
-        (
-            tipo_raw        NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,  -- Col B
-            descripcion_raw NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,  -- Col C
-            proveedor_raw   NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,  -- Col D
-            consorcio_raw   NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL   -- Col E (requerido)
-        );
-
-        DECLARE @Proveedor NVARCHAR(4000) =
-            N'Excel 12.0;HDR=NO;IMEX=1;Database=' + REPLACE(@RutaArchivo, N'''', N'''''');
-        DECLARE @Consulta NVARCHAR(4000) =
-			N'SELECT * FROM [' + @HojaOk + N']';
-
-        DECLARE @Sql NVARCHAR(MAX) = N'
-INSERT INTO #ExcelCrudo(tipo_raw, descripcion_raw, proveedor_raw, consorcio_raw)
-SELECT TRY_CAST(F1 AS NVARCHAR(255)),
-       TRY_CAST(F2 AS NVARCHAR(255)),
-       TRY_CAST(F3 AS NVARCHAR(255)),
-       TRY_CAST(F4 AS NVARCHAR(255))
-FROM OPENROWSET(''Microsoft.ACE.OLEDB.16.0'',
-                ' + QUOTENAME(@Proveedor,'''') + ',
-                ' + QUOTENAME(@Consulta, '''') + ');';
-
-        EXEC sys.sp_executesql @Sql;
-
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @Leidas INT = (SELECT COUNT(*) FROM #ExcelCrudo);
-            DECLARE @DetLeidas NVARCHAR(4000) = N'filas=' + CONVERT(NVARCHAR(20), @Leidas);
-            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Leídas filas desde Excel', @DetLeidas, @RutaArchivo, @LogPath;
-        END
-
-        -- 2) STAGING: tipado básico y mapeo a consorcio
-        IF OBJECT_ID('tempdb..#GastosStg') IS NOT NULL DROP TABLE #GastosStg;
-        CREATE TABLE #GastosStg
-        (
-            idConsorcio INT          NOT NULL,
-            categoria   VARCHAR(35)  COLLATE DATABASE_DEFAULT NULL,
-            descripcion VARCHAR(200) COLLATE DATABASE_DEFAULT NULL,
-            proveedor   VARCHAR(100) COLLATE DATABASE_DEFAULT NULL
-        );
-
-        INSERT INTO #GastosStg(idConsorcio, categoria, descripcion, proveedor)
-        SELECT
-            c.idConsorcio,
-            importacion.fn_LimpiarTexto(tipo_raw,        35),
-            importacion.fn_LimpiarTexto(descripcion_raw, 200),
-            importacion.fn_LimpiarTexto(proveedor_raw,   100)
-        FROM #ExcelCrudo r
-        JOIN app.Tbl_Consorcio c
-          ON c.nombre COLLATE DATABASE_DEFAULT =
-             importacion.fn_LimpiarTexto(r.consorcio_raw, 50)
-        WHERE importacion.fn_LimpiarTexto(r.consorcio_raw, 50) IS NOT NULL;
-
-        -- 3) Expensas: crear las que falten para @UsarFechaExpensa
-        IF OBJECT_ID('tempdb..#Expensas') IS NOT NULL DROP TABLE #Expensas;
-        CREATE TABLE #Expensas (idConsorcio INT PRIMARY KEY, nroExpensa INT NOT NULL);
-
-        -- existentes
-        INSERT INTO #Expensas(idConsorcio, nroExpensa)
-        SELECT e.idConsorcio, e.nroExpensa
-        FROM app.Tbl_Expensa e
-        JOIN (SELECT DISTINCT idConsorcio FROM #GastosStg) d ON d.idConsorcio = e.idConsorcio
-        WHERE e.fechaGeneracion = @UsarFechaExpensa;
-
-        -- crear faltantes
-        INSERT INTO app.Tbl_Expensa (idConsorcio, fechaGeneracion, fechaVto1, fechaVto2, montoTotal)
-        SELECT DISTINCT s.idConsorcio, @UsarFechaExpensa, NULL, NULL, 0
-        FROM #GastosStg s
-        WHERE NOT EXISTS (
-            SELECT 1 FROM app.Tbl_Expensa e
-            WHERE e.idConsorcio = s.idConsorcio AND e.fechaGeneracion = @UsarFechaExpensa
-        );
-
-        -- recargar todas a temp
-        DELETE FROM #Expensas;
-        INSERT INTO #Expensas(idConsorcio, nroExpensa)
-        SELECT e.idConsorcio, e.nroExpensa
-        FROM app.Tbl_Expensa e
-        JOIN (SELECT DISTINCT idConsorcio FROM #GastosStg) d ON d.idConsorcio = e.idConsorcio
-        WHERE e.fechaGeneracion = @UsarFechaExpensa;
-
-        -- 4) Insertar Gasto evitando duplicados (por consorcio+expensa+descripcion+proveedor+categoria)
-        DECLARE @GastosInsertados INT = 0;
-
-        INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
-        SELECT
-            x.nroExpensa,
-            s.idConsorcio,
-            'Ordinario',
-            s.descripcion,
-            CAST(GETDATE() AS DATE),
-            CAST(0 AS DECIMAL(10,2))
-        FROM #GastosStg s
-        JOIN #Expensas x ON x.idConsorcio = s.idConsorcio
-        WHERE NOT EXISTS
-        (
-            SELECT 1
-            FROM app.Tbl_Gasto g
-            LEFT JOIN app.Tbl_Gasto_Ordinario go2 ON go2.idGasto = g.idGasto
-            WHERE g.idConsorcio = s.idConsorcio
-              AND g.nroExpensa  = x.nroExpensa
-              AND ISNULL(g.descripcion,'')        COLLATE DATABASE_DEFAULT = ISNULL(s.descripcion,'')
-              AND ISNULL(go2.nombreProveedor,'')  COLLATE DATABASE_DEFAULT = ISNULL(s.proveedor,'')
-              AND ISNULL(go2.categoria,'')        COLLATE DATABASE_DEFAULT = ISNULL(s.categoria,'')
-        );
-
-        SET @GastosInsertados = @@ROWCOUNT;
-
-        -- 5) Crear detalle ordinario para esos gastos (si no existe)
-        INSERT INTO app.Tbl_Gasto_Ordinario (idGasto, nombreProveedor, categoria, nroFactura)
-        SELECT
-            g.idGasto,
-            s.proveedor,
-            s.categoria,
-            NULL
-        FROM app.Tbl_Gasto g
-        JOIN #Expensas x       ON x.nroExpensa = g.nroExpensa AND x.idConsorcio = g.idConsorcio
-        JOIN #GastosStg s      ON s.idConsorcio = g.idConsorcio
-                              AND ISNULL(g.descripcion,'') COLLATE DATABASE_DEFAULT = ISNULL(s.descripcion,'')
-        LEFT JOIN app.Tbl_Gasto_Ordinario go2 ON go2.idGasto = g.idGasto
-        WHERE g.tipo = 'Ordinario'
-          AND go2.idGasto IS NULL
-          AND g.fechaEmision = CAST(GETDATE() AS DATE)
-          AND g.importe = 0;
-
-        -- 6) Resumen y logs
-        DECLARE @TotalExcel INT = (SELECT COUNT(*) FROM #ExcelCrudo);
-        DECLARE @Validas    INT = (SELECT COUNT(*) FROM #GastosStg);
-
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @DetFin NVARCHAR(4000) =
-                N'gastos_insertados=' + CONVERT(NVARCHAR(20), @GastosInsertados) +
-                N'; filas_validas=' + CONVERT(NVARCHAR(20), @Validas) +
-                N'; filas_excel=' + CONVERT(NVARCHAR(20), @TotalExcel) +
-                N'; fecha_expensa=' + CONVERT(NVARCHAR(10), @UsarFechaExpensa, 120);
-            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Fin OK', @DetFin, @RutaArchivo, @LogPath;
-        END
-
-        SELECT
-            filas_excel    = @TotalExcel,
-            filas_validas  = @Validas,
-            gastos_insert  = @GastosInsertados,
-            mensaje        = N'OK';
-    END TRY
-    BEGIN CATCH
-        DECLARE @MsgError NVARCHAR(4000) = ERROR_MESSAGE();
-        DECLARE @NroError INT            = ERROR_NUMBER();
-        DECLARE @Linea    INT            = ERROR_LINE();
-
-        DECLARE @DetError NVARCHAR(4000) =
-            N'Falla en importación (' + CONVERT(NVARCHAR(20), @NroError) +
-            N' en línea ' + CONVERT(NVARCHAR(20), @Linea) + N')';
-
-        EXEC reportes.Sp_LogReporte
-            @Procedimiento = @Procedimiento,
-            @Tipo          = 'ERROR',
-            @Mensaje       = @DetError,
-            @Detalle       = @MsgError,
-            @RutaArchivo   = @RutaArchivo,
-            @RutaLog       = @LogPath;
-
-        ;THROW;
-    END CATCH
-END
-GO
--- //////////////////////////////////////////////////////////////////////
-CREATE OR ALTER PROCEDURE importacion.Sp_CargarConsorcioYUF_DesdeCsv
-    @RutaArchivo NVARCHAR(4000),            -- C:\...\Inquilino-propietarios-UF.csv
-    @HDR         BIT = 1,                   -- 1 = primera fila encabezado
-    @LogPath     NVARCHAR(4000) = NULL,     -- opcional: archivo .log
-    @Verbose     BIT = 0                    -- 1 = logs INFO
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @Procedimiento SYSNAME = N'importacion.Sp_CargarConsorcioYUF_DesdeCsv';
-
-    BEGIN TRY
-        IF @Verbose = 1
-            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Inicio del proceso', NULL, @RutaArchivo, @LogPath;
-
-        /* 1) Leer CSV (UTF-8, separador |) a tabla temporal */
-        IF OBJECT_ID('tempdb..#CsvCrudo','U') IS NOT NULL DROP TABLE #CsvCrudo;
-        CREATE TABLE #CsvCrudo
-        (
-            [CVU/CBU]              NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,
-            [Nombre del consorcio] NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,
-            [nroUnidadFuncional]   NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
-            [piso]                 NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
-            [departamento]         NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL
-        );
-
-        DECLARE @PrimeraFila INT = CASE WHEN @HDR = 1 THEN 2 ELSE 1 END;
-        DECLARE @RutaEsc NVARCHAR(4000) = REPLACE(@RutaArchivo, N'''', N'''''');
-        DECLARE @PrimeraFilaTxt NVARCHAR(10) = CONVERT(NVARCHAR(10), @PrimeraFila);
-
-        DECLARE @SqlBulk NVARCHAR(MAX);
-        SET @SqlBulk =
-              N'BULK INSERT #CsvCrudo '
-            + N'FROM ''' + @RutaEsc + N''' '
-            + N'WITH ( '
-            + N' FIRSTROW = ' + @PrimeraFilaTxt
-            + N',FIELDTERMINATOR = ''|'''
-            + N',ROWTERMINATOR   = ''0x0d0a'''
-            + N',CODEPAGE        = ''65001'''
-            + N',KEEPNULLS, TABLOCK );';
-        EXEC (@SqlBulk);
-
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @FilasCsv INT = (SELECT COUNT(*) FROM #CsvCrudo);
-            DECLARE @DetLeidas NVARCHAR(4000) = N'filas_csv=' + CONVERT(NVARCHAR(20), @FilasCsv);
-            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Archivo leído', @DetLeidas, @RutaArchivo, @LogPath;
-        END
-
-        /* 2) STAGING (normalizo texto y CBU; PB => 0) */
-        IF OBJECT_ID('tempdb..#UF_Stg','U') IS NOT NULL DROP TABLE #UF_Stg;
-        CREATE TABLE #UF_Stg
-        (
-            idUnidadFuncional INT         NULL,  -- puede venir vacío, no lo forzamos
-            nombre            VARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,
-            piso              TINYINT     NULL,
-            departamento      CHAR(1)     COLLATE DATABASE_DEFAULT NULL,
-            cbu_cvu_norm      CHAR(22)    COLLATE DATABASE_DEFAULT NULL
-        );
-
-        INSERT INTO #UF_Stg (idUnidadFuncional, nombre, piso, departamento, cbu_cvu_norm)
-        SELECT
-            TRY_CONVERT(INT, NULLIF(LTRIM(RTRIM([nroUnidadFuncional])), '')),
-            importacion.fn_LimpiarTexto([Nombre del consorcio], 50),
-            CASE
-                WHEN UPPER(LTRIM(RTRIM([piso]))) IN (N'PB', N'P.B', N'P.B.', N'PLANTA BAJA') THEN 0
-                ELSE TRY_CONVERT(TINYINT, NULLIF(LTRIM(RTRIM([piso])), ''))
-            END,
-            CASE
-                WHEN NULLIF(LTRIM(RTRIM([departamento])), '') IS NULL THEN NULL
-                ELSE SUBSTRING(LTRIM(RTRIM([departamento])), 1, 1)
-            END,
-            CASE
-                WHEN LEN(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
-                         LTRIM(RTRIM([CVU/CBU])),' ',''),'-',''),'.',''),'/',''),'\',''),'_',''),
-                         '(' ,''),')',''),CHAR(9),''),CHAR(160),'')) = 22
-                 AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
-                         LTRIM(RTRIM([CVU/CBU])),' ',''),'-',''),'.',''),'/',''),'\',''),'_',''),
-                         '(' ,''),')',''),CHAR(9),''),CHAR(160),'') NOT LIKE '%[^0-9]%'
-                THEN CONVERT(CHAR(22),
-                     REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
-                     LTRIM(RTRIM([CVU/CBU])),' ',''),'-',''),'.',''),'/',''),'\',''),'_',''),
-                     '(' ,''),')',''),CHAR(9),''),CHAR(160),'')) 
-                ELSE NULL
-            END
-        FROM #CsvCrudo
-        WHERE importacion.fn_LimpiarTexto([Nombre del consorcio], 50) IS NOT NULL;
-
-        /* 3) DEDUP simple */
-        IF OBJECT_ID('tempdb..#UF_Dedup','U') IS NOT NULL DROP TABLE #UF_Dedup;
-        SELECT DISTINCT idUnidadFuncional, nombre, piso, departamento, cbu_cvu_norm
-        INTO #UF_Dedup
-        FROM #UF_Stg;
-
-        /* 4) Asegurar consorcios */
-        INSERT INTO app.Tbl_Consorcio (nombre, direccion, superficieTotal)
-        SELECT d.nombre, NULL, NULL
-        FROM (SELECT DISTINCT nombre FROM #UF_Dedup) d
-        WHERE NOT EXISTS (
-            SELECT 1 FROM app.Tbl_Consorcio c 
-            WHERE c.nombre COLLATE DATABASE_DEFAULT = d.nombre
-        );
-
-        /* 5) ACTUALIZAR UFs existentes
-              a) por idUnidadFuncional si vino en el archivo
-              b) si NO vino id, por match lógico (consorcio + piso + departamento)
-              Siempre cuidando CBU_CVU UNIQUE
-        */
-
-        -- a) update por id
-        UPDATE u
-           SET u.piso         = d.piso,
-               u.departamento = d.departamento,
-               u.CBU_CVU      = CASE
-                                   WHEN d.cbu_cvu_norm IS NULL THEN u.CBU_CVU
-                                   WHEN u.CBU_CVU = d.cbu_cvu_norm THEN u.CBU_CVU
-                                   WHEN NOT EXISTS (SELECT 1 FROM app.Tbl_UnidadFuncional x 
-                                                    WHERE x.CBU_CVU = d.cbu_cvu_norm
-                                                      AND x.idUnidadFuncional <> u.idUnidadFuncional)
-                                   THEN d.cbu_cvu_norm
-                                   ELSE u.CBU_CVU
-                                END
-        FROM app.Tbl_UnidadFuncional u
-        JOIN #UF_Dedup d ON d.idUnidadFuncional IS NOT NULL
-                        AND d.idUnidadFuncional = u.idUnidadFuncional
-        JOIN app.Tbl_Consorcio c 
-          ON c.nombre COLLATE DATABASE_DEFAULT = d.nombre COLLATE DATABASE_DEFAULT;
-
-        DECLARE @upd_por_id INT = @@ROWCOUNT;
-
-        -- b) update por (consorcio+piso+depto) cuando NO vino id
-        UPDATE u
-           SET u.CBU_CVU = CASE
-                               WHEN d.cbu_cvu_norm IS NULL THEN u.CBU_CVU
-                               WHEN u.CBU_CVU = d.cbu_cvu_norm THEN u.CBU_CVU
-                               WHEN NOT EXISTS (SELECT 1 FROM app.Tbl_UnidadFuncional x 
-                                                WHERE x.CBU_CVU = d.cbu_cvu_norm
-                                                  AND x.idUnidadFuncional <> u.idUnidadFuncional)
-                               THEN d.cbu_cvu_norm
-                               ELSE u.CBU_CVU
-                           END
-        FROM app.Tbl_UnidadFuncional u
-        JOIN app.Tbl_Consorcio c ON c.idConsorcio = u.idConsorcio
-        JOIN #UF_Dedup d
-          ON d.idUnidadFuncional IS NULL
-         AND c.nombre COLLATE DATABASE_DEFAULT = d.nombre COLLATE DATABASE_DEFAULT
-         AND ISNULL(u.piso,255) = ISNULL(d.piso,255)
-         AND ISNULL(u.departamento,'') COLLATE DATABASE_DEFAULT = ISNULL(d.departamento,'') COLLATE DATABASE_DEFAULT;
-
-        DECLARE @upd_por_match INT = @@ROWCOUNT;
-
-        DECLARE @UFsActualizadas INT = @upd_por_id + @upd_por_match;
-
-        /* 6) INSERTAR UFs nuevas SIN IDENTITY_INSERT
-              Criterio: que NO exista ni por id (si vino) ni por match lógico
-        */
-        INSERT INTO app.Tbl_UnidadFuncional
-            (idConsorcio, piso, departamento, superficie, metrosBaulera, metrosCochera, porcentaje, CBU_CVU)
-        SELECT
-            c.idConsorcio,
-            d.piso,
-            d.departamento,
-            NULL, NULL, NULL, NULL,
-            d.cbu_cvu_norm
-        FROM #UF_Dedup d
-        JOIN app.Tbl_Consorcio c 
-          ON c.nombre COLLATE DATABASE_DEFAULT = d.nombre COLLATE DATABASE_DEFAULT
-        WHERE
-            -- no existe por id (cuando vino id)
-            NOT EXISTS (
-                SELECT 1 FROM app.Tbl_UnidadFuncional u
-                WHERE d.idUnidadFuncional IS NOT NULL
-                  AND u.idUnidadFuncional = d.idUnidadFuncional
-            )
-            -- y no existe por match lógico
-            AND NOT EXISTS (
-                SELECT 1 FROM app.Tbl_UnidadFuncional u
-                WHERE u.idConsorcio = c.idConsorcio
-                  AND ISNULL(u.piso,255) = ISNULL(d.piso,255)
-                  AND ISNULL(u.departamento,'') COLLATE DATABASE_DEFAULT =
-                      ISNULL(d.departamento,'') COLLATE DATABASE_DEFAULT
-            )
-            -- y CBU_CVU libre (si viene)
-            AND (
-                 d.cbu_cvu_norm IS NULL
-              OR NOT EXISTS (SELECT 1 FROM app.Tbl_UnidadFuncional u2 WHERE u2.CBU_CVU = d.cbu_cvu_norm)
-            );
-
-        DECLARE @UFsInsertadas INT = @@ROWCOUNT;
-
-        /* 7) Resumen + log */
-        DECLARE @TotalCsv INT = (SELECT COUNT(*) FROM #CsvCrudo);
-        DECLARE @FilasStg INT = (SELECT COUNT(*) FROM #UF_Stg);
-        DECLARE @FilasDed INT = (SELECT COUNT(*) FROM #UF_Dedup);
-
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @DetalleFin NVARCHAR(4000);
-            SET @DetalleFin = N'csv=' + CONVERT(NVARCHAR(20), @TotalCsv)
-                            + N'; staging=' + CONVERT(NVARCHAR(20), @FilasStg)
-                            + N'; dedup=' + CONVERT(NVARCHAR(20), @FilasDed)
-                            + N'; ufs_upd=' + CONVERT(NVARCHAR(20), @UFsActualizadas)
-                            + N'; ufs_ins=' + CONVERT(NVARCHAR(20), @UFsInsertadas);
-            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Fin OK', @DetalleFin, @RutaArchivo, @LogPath;
-        END
-
-        SELECT
-            total_csv        = @TotalCsv,
-            procesadas_stg   = @FilasStg,
-            sin_duplicados   = @FilasDed,
-            ufs_actualizadas = @UFsActualizadas,
-            ufs_insertadas   = @UFsInsertadas,
-            mensaje          = N'OK';
-    END TRY
-    BEGIN CATCH
-        DECLARE @MsgError NVARCHAR(4000) = ERROR_MESSAGE();
-        DECLARE @DetErr  NVARCHAR(4000) = N'Error en línea ' + CONVERT(NVARCHAR(10), ERROR_LINE());
-        EXEC reportes.Sp_LogReporte
-            @Procedimiento = @Procedimiento,
-            @Tipo          = 'ERROR',
-            @Mensaje       = @DetErr,
-            @Detalle       = @MsgError,
-            @RutaArchivo   = @RutaArchivo,
-            @RutaLog       = @LogPath;
-        THROW;
-    END CATCH
-END
-GO
--- //////////////////////////////////////////////////////////////////////
-CREATE OR ALTER PROCEDURE importacion.Sp_CargarUFsDesdeTxt
-    @RutaArchivo    NVARCHAR(4000),
-    @HDR            BIT = 1,
-    @RowTerminator  NVARCHAR(10) = N'0x0d0a',
-    @CodePage       NVARCHAR(16) = N'65001',
-    @LogPath        NVARCHAR(4000) = NULL,
-    @Verbose        BIT = 0
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @Procedimiento SYSNAME = N'importacion.Sp_CargarUFsDesdeTxt';
-
-    BEGIN TRY
-        IF @Verbose = 1
-            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Inicio del proceso', NULL, @RutaArchivo, @LogPath;
-
-        /* 1) RAW */
-        IF OBJECT_ID('tempdb..#RawUF','U') IS NOT NULL DROP TABLE #RawUF;
-        CREATE TABLE #RawUF
-        (
-            [Nombre del consorcio] NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,
-            [nroUnidadFuncional]   NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
-            [Piso]                 NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
-            [departamento]         NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
-            [coeficiente]          NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
-            [m2_unidad_funcional]  NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
-            [bauleras]             NVARCHAR(10)  COLLATE DATABASE_DEFAULT NULL,
-            [cochera]              NVARCHAR(10)  COLLATE DATABASE_DEFAULT NULL,
-            [m2_baulera]           NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
-            [m2_cochera]           NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL
-        );
-
-        DECLARE @PrimeraFila INT = CASE WHEN @HDR = 1 THEN 2 ELSE 1 END;
-        DECLARE @RutaEsc NVARCHAR(4000) = REPLACE(@RutaArchivo, N'''', N'''''');
-
-        DECLARE @SqlBulk NVARCHAR(MAX) =
-            N'BULK INSERT #RawUF FROM ''' + @RutaEsc + N''' ' +
-            N'WITH ( FIRSTROW=' + CONVERT(NVARCHAR(10), @PrimeraFila) +
-            N', FIELDTERMINATOR=''0x09''' +
-            N', ROWTERMINATOR=''' + @RowTerminator + N'''' +
-            N', CODEPAGE='''      + @CodePage      + N'''' +
-            N', KEEPNULLS, TABLOCK );';
-        EXEC (@SqlBulk);
-
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @FilasTxt INT = (SELECT COUNT(*) FROM #RawUF);
-            DECLARE @Det1 NVARCHAR(4000) = N'filas_txt=' + CONVERT(NVARCHAR(20), @FilasTxt);
-            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Archivo TXT leído',
-                 @Det1, @RutaArchivo, @LogPath;
-        END
-
-        /* 2) STG normalizado */
-        IF OBJECT_ID('tempdb..#Stg','U') IS NOT NULL DROP TABLE #Stg;
-        CREATE TABLE #Stg
-        (
-            nombre           VARCHAR(50)   COLLATE DATABASE_DEFAULT NOT NULL,
-            piso             TINYINT       NULL,
-            departamento     CHAR(1)       COLLATE DATABASE_DEFAULT NULL,
-            porcentaje       DECIMAL(5,2)  NULL,
-            superficie       DECIMAL(7,2)  NULL,
-            metrosBaulera    DECIMAL(5,2)  NULL,
-            metrosCochera    DECIMAL(5,2)  NULL
-        );
-
-        INSERT INTO #Stg (nombre, piso, departamento, porcentaje, superficie, metrosBaulera, metrosCochera)
-        SELECT
-            importacion.fn_LimpiarTexto([Nombre del consorcio], 50),
-            CASE WHEN UPPER(LTRIM(RTRIM([Piso]))) IN (N'PB',N'P.B',N'P.B.',N'PLANTA BAJA') THEN 0
-                 ELSE TRY_CONVERT(TINYINT, NULLIF(LTRIM(RTRIM([Piso])),'')) END,
-            CASE WHEN NULLIF(LTRIM(RTRIM([departamento])), '') IS NULL THEN NULL
-                 ELSE SUBSTRING(LTRIM(RTRIM([departamento])), 1, 1) END,
-            importacion.fn_A_Decimal([coeficiente]),
-            importacion.fn_A_Decimal([m2_unidad_funcional]),
-            importacion.fn_A_Decimal([m2_baulera]),
-            importacion.fn_A_Decimal([m2_cochera])
-        FROM #RawUF
-        WHERE importacion.fn_LimpiarTexto([Nombre del consorcio], 50) IS NOT NULL;
-
-        /* 3) Consorcios */
-        INSERT INTO app.Tbl_Consorcio (nombre, direccion, superficieTotal)
-        SELECT DISTINCT s.nombre, NULL, NULL
-        FROM #Stg s
-        WHERE NOT EXISTS (
-            SELECT 1 FROM app.Tbl_Consorcio c
-            WHERE c.nombre COLLATE DATABASE_DEFAULT = s.nombre COLLATE DATABASE_DEFAULT
-        );
-
-        /* 4) UPDATE UFs existentes (consorcio+piso+depto) */
-        UPDATE u
-           SET u.superficie    = COALESCE(s.superficie, u.superficie),
-               u.metrosBaulera = COALESCE(s.metrosBaulera, u.metrosBaulera),
-               u.metrosCochera = COALESCE(s.metrosCochera, u.metrosCochera),
-               u.porcentaje    = COALESCE(s.porcentaje, u.porcentaje)
-        FROM app.Tbl_UnidadFuncional u
-        JOIN app.Tbl_Consorcio c ON c.idConsorcio = u.idConsorcio
-        JOIN #Stg s
-          ON c.nombre COLLATE DATABASE_DEFAULT = s.nombre COLLATE DATABASE_DEFAULT
-         AND ISNULL(u.piso,255) = ISNULL(s.piso,255)
-         AND ISNULL(u.departamento,'') COLLATE DATABASE_DEFAULT
-             = ISNULL(s.departamento,'') COLLATE DATABASE_DEFAULT;
-
-        DECLARE @UFsActualizadas INT = @@ROWCOUNT;
-
-        /* 5) INSERT UFs nuevas (dedup RN=1) */
-        ;WITH src AS (
-            SELECT
-                c.idConsorcio,
-                s.piso,
-                s.departamento,
-                s.superficie,
-                s.metrosBaulera,
-                s.metrosCochera,
-                s.porcentaje,
-                ROW_NUMBER() OVER (
-                    PARTITION BY c.idConsorcio, s.piso, s.departamento
-                    ORDER BY (SELECT 0)
-                ) AS rn
-            FROM #Stg s
-            JOIN app.Tbl_Consorcio c
-              ON c.nombre COLLATE DATABASE_DEFAULT = s.nombre COLLATE DATABASE_DEFAULT
-        )
-        INSERT INTO app.Tbl_UnidadFuncional
-            (idConsorcio, piso, departamento, superficie, metrosBaulera, metrosCochera, porcentaje)
-        SELECT
-            x.idConsorcio, x.piso, x.departamento, x.superficie, x.metrosBaulera, x.metrosCochera, x.porcentaje
-        FROM src x
-        WHERE x.rn = 1
-          AND NOT EXISTS (
-                SELECT 1
-                FROM app.Tbl_UnidadFuncional u
-                WHERE u.idConsorcio = x.idConsorcio
-                  AND ISNULL(u.piso,255) = ISNULL(x.piso,255)
-                  AND ISNULL(u.departamento,'') COLLATE DATABASE_DEFAULT
-                      = ISNULL(x.departamento,'') COLLATE DATABASE_DEFAULT
-          );
-
-        DECLARE @UFsInsertadas INT = @@ROWCOUNT;
-
-        /* 6) Resumen + log */
-        DECLARE @TotTxt INT = (SELECT COUNT(*) FROM #RawUF);
-        DECLARE @TotStg INT = (SELECT COUNT(*) FROM #Stg);
-
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @DetFin NVARCHAR(4000) =
-                N'txt=' + CONVERT(NVARCHAR(20), @TotTxt) +
-                N'; stg=' + CONVERT(NVARCHAR(20), @TotStg) +
-                N'; ufs_upd=' + CONVERT(NVARCHAR(20), @UFsActualizadas) +
-                N'; ufs_ins=' + CONVERT(NVARCHAR(20), @UFsInsertadas);
-            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Fin OK',
-                 @DetFin, @RutaArchivo, @LogPath;
-        END
-
-        SELECT
-            filas_txt        = @TotTxt,
-            filas_validas    = @TotStg,
-            ufs_actualizadas = @UFsActualizadas,
-            ufs_insertadas   = @UFsInsertadas,
-            mensaje          = N'OK: cargado/actualizado (PB=0; decimales normalizados; CBU_CVU NULL permitido)';
-    END TRY
-    BEGIN CATCH
-        DECLARE @MsgError NVARCHAR(4000) = ERROR_MESSAGE();
-        DECLARE @DetErr  NVARCHAR(4000) = N'Error en línea ' + CONVERT(NVARCHAR(10), ERROR_LINE());
-        EXEC reportes.Sp_LogReporte
-            @Procedimiento = @Procedimiento,
-            @Tipo          = 'ERROR',
-            @Mensaje       = @DetErr,
-            @Detalle       = @MsgError,
-            @RutaArchivo   = @RutaArchivo,
-            @RutaLog       = @LogPath;
-        THROW;
-    END CATCH
-END
-GO
--- //////////////////////////////////////////////////////////////////////
-CREATE OR ALTER PROCEDURE importacion.Sp_CargarUFInquilinosDesdeCsv
-    @RutaArchivo    NVARCHAR(4000),            -- C:\...\Inquilino-propietarios-datos.csv
-    @HDR            BIT = 1,                   -- 1 = primera fila encabezado
-    @RowTerminator  NVARCHAR(10) = N'0x0d0a',  -- CRLF (usar '0x0a' si solo LF)
-    @CodePage       NVARCHAR(16) = N'ACP',     -- Latin-1; usar '65001' si UTF-8
-    @LogPath        NVARCHAR(4000) = NULL,     -- opcional: archivo .log
-    @Verbose        BIT = 0                    -- 1 = logs INFO
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @Procedimiento SYSNAME = N'importacion.Sp_CargarUFInquilinosDesdeCsv';
-
-    BEGIN TRY
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @Det0 NVARCHAR(4000) = NULL;
-            EXEC reportes.Sp_LogReporte
-                 @Procedimiento = @Procedimiento,
-                 @Tipo          = 'INFO',
-                 @Mensaje       = N'Inicio del proceso',
-                 @Detalle       = @Det0,
-                 @RutaArchivo   = @RutaArchivo,
-                 @RutaLog       = @LogPath;
-        END
-
-        /* 1) RAW del CSV (';') */
-        IF OBJECT_ID('tempdb..#Raw','U') IS NOT NULL DROP TABLE #Raw;
-        CREATE TABLE #Raw
-        (
-            [Nombre]                 NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,
-            [apellido]               NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,
-            [DNI]                    NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
-            [email personal]         NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,
-            [telfono de contacto]   NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL, -- viene así
-            [CVU/CBU]                NVARCHAR(64)  COLLATE DATABASE_DEFAULT NULL,
-            [Inquilino]              NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL
-        );
-
-        DECLARE @PrimeraFila INT = CASE WHEN @HDR=1 THEN 2 ELSE 1 END;
-        DECLARE @PrimeraFilaTxt NVARCHAR(10) = CONVERT(NVARCHAR(10), @PrimeraFila);
-        DECLARE @RutaEsc NVARCHAR(4000) = REPLACE(@RutaArchivo, N'''', N'''''');
-
-        DECLARE @SqlBulk NVARCHAR(MAX);
-        SET @SqlBulk = CONCAT(
-            N'BULK INSERT #Raw FROM ''', @RutaEsc, N''' WITH ( ',
-            N'FIRSTROW = ', @PrimeraFilaTxt,
-            N', FIELDTERMINATOR = '';''',
-            N', ROWTERMINATOR  = ''', @RowTerminator, N'''',
-            N', CODEPAGE       = ''', @CodePage, N'''',
-            N', KEEPNULLS, TABLOCK );'
-        );
-
-        EXEC (@SqlBulk);
-
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @FilasRaw INT = (SELECT COUNT(*) FROM #Raw);
-            DECLARE @Det1 NVARCHAR(4000) = CONCAT(N'filas_csv=', CONVERT(NVARCHAR(20), @FilasRaw));
-            EXEC reportes.Sp_LogReporte
-                 @Procedimiento = @Procedimiento,
-                 @Tipo          = 'INFO',
-                 @Mensaje       = N'CSV leído',
-                 @Detalle       = @Det1,
-                 @RutaArchivo   = @RutaArchivo,
-                 @RutaLog       = @LogPath;
-        END
-
-        /* 2) STAGING: normalizar CBU/CVU (22 dígitos) y mapear inquilino */
-        IF OBJECT_ID('tempdb..#Stg','U') IS NOT NULL DROP TABLE #Stg;
-        CREATE TABLE #Stg
-        (
-            cbu_cvu     CHAR(22)     COLLATE DATABASE_DEFAULT NOT NULL,
-            esInquilino BIT          NOT NULL,
-            dni         INT          NULL,
-            nombre      VARCHAR(100) COLLATE DATABASE_DEFAULT NULL,
-            apellido    VARCHAR(100) COLLATE DATABASE_DEFAULT NULL,
-            email       VARCHAR(255) COLLATE DATABASE_DEFAULT NULL,
-            telefono    VARCHAR(50)  COLLATE DATABASE_DEFAULT NULL
-        );
-
-        ;WITH s AS
-        (
-            SELECT
-                cbu_raw = LTRIM(RTRIM([CVU/CBU])),
-                inq_raw = LTRIM(RTRIM([Inquilino])),
-                dni_raw = LTRIM(RTRIM([DNI])),
-                nom_raw = LTRIM(RTRIM([Nombre])),
-                ape_raw = LTRIM(RTRIM([apellido])),
-                mail_raw= LTRIM(RTRIM([email personal])),
-                tel_raw = LTRIM(RTRIM([telfono de contacto]))
-            FROM #Raw
-        ),
-        n AS
-        (
-            SELECT
-                cbu_norm =
-                    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
-                        s.cbu_raw,' ',''),'-',''),'.',''),'/',''),'\',''),'_',''),
-                        '(' ,''),')',''),CHAR(9),''),CHAR(160),''),
-                inq_norm = LOWER(s.inq_raw),
-                dni_norm = TRY_CONVERT(INT, NULLIF(s.dni_raw,'')),
-                nom_norm = NULLIF(s.nom_raw,''),
-                ape_norm = NULLIF(s.ape_raw,''),
-                mail_norm= NULLIF(s.mail_raw,''),
-                tel_norm =
-                    NULLIF(REPLACE(REPLACE(REPLACE(REPLACE(s.tel_raw,' ',''),'-',''),'(',''),')',''), '')
-            FROM s
-        )
-        INSERT INTO #Stg (cbu_cvu, esInquilino, dni, nombre, apellido, email, telefono)
-        SELECT DISTINCT
-            CONVERT(CHAR(22), n.cbu_norm),
-            CASE 
-                WHEN n.inq_norm COLLATE DATABASE_DEFAULT IN (N'si',N'sí',N'true',N'1',N'inquilino') THEN 1
-                WHEN n.inq_norm COLLATE DATABASE_DEFAULT IN (N'no',N'false',N'0',N'propietario') THEN 0
-            END,
-            n.dni_norm,
-            CASE WHEN n.nom_norm  IS NULL THEN NULL ELSE LEFT(n.nom_norm ,100) END,
-            CASE WHEN n.ape_norm  IS NULL THEN NULL ELSE LEFT(n.ape_norm ,100) END,
-			CASE
-                WHEN n.mail_norm IS NULL THEN NULL
-                WHEN importacion.fn_EmailValido(n.mail_norm) = 1
-                     THEN LEFT(n.mail_norm, 255)
-                ELSE NULL
-            END,
-			CASE WHEN n.tel_norm  IS NULL THEN NULL ELSE LEFT(n.tel_norm ,50)  END
-        FROM n
-        WHERE n.cbu_norm IS NOT NULL
-          AND LEN(n.cbu_norm)=22
-          AND n.cbu_norm NOT LIKE '%[^0-9]%'
-          AND n.inq_norm IS NOT NULL
-          AND n.inq_norm COLLATE DATABASE_DEFAULT IN
-              (N'si',N'sí',N'true',N'1',N'inquilino', N'no',N'false',N'0',N'propietario');
-
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @FilasStg INT = (SELECT COUNT(*) FROM #Stg);
-            DECLARE @Det2 NVARCHAR(4000) = CONCAT(N'filas_stg_validas=', CONVERT(NVARCHAR(20), @FilasStg));
-            EXEC reportes.Sp_LogReporte
-                 @Procedimiento = @Procedimiento,
-                 @Tipo          = 'INFO',
-                 @Mensaje       = N'STG listo',
-                 @Detalle       = @Det2,
-                 @RutaArchivo   = @RutaArchivo,
-                 @RutaLog       = @LogPath;
-        END
-
-        /* 3) INSERTAR faltantes en app.Tbl_Persona (usa IDX_CVU_CBU_PERSONA) */
-        DECLARE @ColsTarget NVARCHAR(MAX) = N'CBU_CVU';
-        DECLARE @ColsSource NVARCHAR(MAX) = N's.cbu_cvu';
-
-        IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'dni')
-        BEGIN
-            SET @ColsTarget = CONCAT(@ColsTarget, N', dni');
-            SET @ColsSource = CONCAT(@ColsSource, N', s.dni');
-        END
-
-        IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'nombre')
-        BEGIN
-            SET @ColsTarget = CONCAT(@ColsTarget, N', nombre');
-            SET @ColsSource = CONCAT(@ColsSource, N', s.nombre');
-        END
-
-        IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'apellido')
-        BEGIN
-            SET @ColsTarget = CONCAT(@ColsTarget, N', apellido');
-            SET @ColsSource = CONCAT(@ColsSource, N', s.apellido');
-        END
-
-        IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'email')
-        BEGIN
-            SET @ColsTarget = CONCAT(@ColsTarget, N', email');
-            SET @ColsSource = CONCAT(@ColsSource, N', s.email');
-        END
-
-        IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'telefono')
-        BEGIN
-            SET @ColsTarget = CONCAT(@ColsTarget, N', telefono');
-            SET @ColsSource = CONCAT(@ColsSource, N', s.telefono');
-        END
-
-        DECLARE @SqlInsPer NVARCHAR(MAX) =
-    CONCAT(
-        N'INSERT INTO app.Tbl_Persona (', @ColsTarget, N') ',
-        N'SELECT ', @ColsSource, N' ',
-        N'FROM #Stg s ',
-        N'WHERE NOT EXISTS (SELECT 1 FROM app.Tbl_Persona p WHERE p.CBU_CVU = s.cbu_cvu);'
-    );
-
-        EXEC (@SqlInsPer);
-
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @NuevasPersonas INT =
-                (SELECT COUNT(*) FROM #Stg s
-                 WHERE NOT EXISTS (SELECT 1 FROM app.Tbl_Persona p WHERE p.CBU_CVU = s.cbu_cvu));
-            DECLARE @Det3 NVARCHAR(4000) = CONCAT(N'personas_nuevas=', CONVERT(NVARCHAR(20), @NuevasPersonas));
-            EXEC reportes.Sp_LogReporte
-                 @Procedimiento = @Procedimiento,
-                 @Tipo          = 'INFO',
-                 @Mensaje       = N'Personas insertadas (faltantes)',
-                 @Detalle       = @Det3,
-                 @RutaArchivo   = @RutaArchivo,
-                 @RutaLog       = @LogPath;
-        END
-
-        /* 4) VINCULAR Persona y Consorcio por el MISMO CBU_CVU y upsert en UFPersona (sin idUnidadFuncional) */
-IF OBJECT_ID('tempdb.#MatchCBU','U') IS NOT NULL DROP TABLE #MatchCBU;
-CREATE TABLE #MatchCBU
-(
-    idPersona    INT NOT NULL,
-    idConsorcio  INT NOT NULL,
-    esInquilino  BIT NOT NULL
-);
-
-INSERT INTO #MatchCBU (idPersona, idConsorcio, esInquilino)
-SELECT
-    p.idPersona,
-    u.idConsorcio,
-    s.esInquilino
-FROM #Stg s
-JOIN app.Tbl_Persona p ON p.CBU_CVU = s.cbu_cvu
-JOIN app.Tbl_UnidadFuncional u WITH (INDEX = UQ_UnidadFuncional_CBU_CVU) ON u.CBU_CVU = s.cbu_cvu;
-
-IF @Verbose = 1
-BEGIN
-    DECLARE @Det4 NVARCHAR(4000) = CONCAT(N'matcheos_cbu=', (SELECT COUNT(*) FROM #MatchCBU));
-    EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Match Persona↔Consorcio por CBU', @Det4, @RutaArchivo, @LogPath;
-END
-
--- UPDATE si ya existe (idPersona + idConsorcio)
-UPDATE uf
-   SET uf.esInquilino = m.esInquilino
-FROM app.Tbl_UFPersona uf
-JOIN #MatchCBU m
-  ON m.idPersona = uf.idPersona
- AND m.idConsorcio = uf.idConsorcio;
-
-DECLARE @RowsUpd INT = @@ROWCOUNT;
-
--- INSERT si no existe (idPersona + idConsorcio)
-INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino, fechaInicio, fechaFin)
-SELECT m.idPersona, m.idConsorcio, m.esInquilino, NULL, NULL
-FROM #MatchCBU m
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM app.Tbl_UFPersona uf
-    WHERE uf.idPersona   = m.idPersona
-      AND uf.idConsorcio = m.idConsorcio
-);
-
-DECLARE @RowsIns INT = @@ROWCOUNT;
-
-        /* 5) Resumen */
-        DECLARE @TotCsv INT = (SELECT COUNT(*) FROM #Raw);
-        DECLARE @TotStg INT = (SELECT COUNT(*) FROM #Stg);
-        DECLARE @TotMatchCBU INT = (SELECT COUNT(*) FROM #MatchCBU);
-
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @Det5 NVARCHAR(4000) =
-                CONCAT(N'csv=', @TotCsv,
-                       N'; stg=', @TotStg,
-                       N'; match_cbu=', @TotMatchCBU,
-                       N'; uf_upd=', @RowsUpd,
-                       N'; uf_ins=', @RowsIns);
-            EXEC reportes.Sp_LogReporte
-                 @Procedimiento = @Procedimiento,
-                 @Tipo          = 'INFO',
-                 @Mensaje       = N'Fin OK',
-                 @Detalle       = @Det5,
-                 @RutaArchivo   = @RutaArchivo,
-                 @RutaLog       = @LogPath;
-        END
-
-        SELECT
-            filas_csv_total           = @TotCsv,
-            filas_validas_stg         = @TotStg,
-            vinculos_por_cbu          = @TotMatchCBU,
-            uf_actualizadas           = @RowsUpd,
-            uf_insertadas             = @RowsIns,
-            mensaje                   = N'OK';
-    END TRY
-    BEGIN CATCH
-        DECLARE @MsgError NVARCHAR(4000) = ERROR_MESSAGE();
-        DECLARE @DetErr NVARCHAR(4000) = CONCAT(N'Error en línea ', CONVERT(NVARCHAR(10), ERROR_LINE()));
-        EXEC reportes.Sp_LogReporte
-            @Procedimiento = @Procedimiento,
-            @Tipo          = 'ERROR',
-            @Mensaje       = @DetErr,
-            @Detalle       = @MsgError,
-            @RutaArchivo   = @RutaArchivo,
-            @RutaLog       = @LogPath;
-        THROW;
-    END CATCH
-END
-GO
--- //////////////////////////////////////////////////////////////////////
 CREATE OR ALTER PROCEDURE importacion.Sp_CargarGastosDesdeJson
     @RutaArchivo NVARCHAR(4000),
     @Anio        INT,
@@ -1443,23 +551,740 @@ BEGIN
 END
 GO
 -- //////////////////////////////////////////////////////////////////////
--- Cargar un insert de lote de expensas y estado cuenta
--- //////////////////////////////////////////////////////////////////////
-IF OBJECT_ID('importacion.Tbl_PagoNoAsociado', 'U') IS NULL
+CREATE OR ALTER PROCEDURE importacion.Sp_CargarConsorcioYUF_DesdeCsv
+    @RutaArchivo NVARCHAR(4000),            -- C:\...\Inquilino-propietarios-UF.csv
+    @HDR         BIT = 1,                   -- 1 = primera fila encabezado
+    @LogPath     NVARCHAR(4000) = NULL,     -- opcional: archivo .log
+    @Verbose     BIT = 0                    -- 1 = logs INFO
+AS
 BEGIN
-    CREATE TABLE importacion.Tbl_PagoNoAsociado
-    (
-        idPagoNoAsociado INT IDENTITY(1,1) PRIMARY KEY,
-        fechaRegistro    DATETIME2(0) NOT NULL CONSTRAINT DF_PagoNoAsoc_fechaRegistro DEFAULT SYSDATETIME(),
-        motivo           NVARCHAR(200)  COLLATE DATABASE_DEFAULT NULL,
-        fecha_txt        NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
-        cbu_txt          NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
-        valor_txt        NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
-        rutaArchivo      NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL
-    );
+    SET NOCOUNT ON;
+
+    DECLARE @Procedimiento SYSNAME = N'importacion.Sp_CargarConsorcioYUF_DesdeCsv';
+
+    BEGIN TRY
+        IF @Verbose = 1
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Inicio del proceso', NULL, @RutaArchivo, @LogPath;
+
+        /* 1) Leer CSV (UTF-8, separador |) a tabla temporal */
+        IF OBJECT_ID('tempdb..#CsvCrudo','U') IS NOT NULL DROP TABLE #CsvCrudo;
+        CREATE TABLE #CsvCrudo
+        (
+            [CVU/CBU]              NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,
+            [Nombre del consorcio] NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,
+            [nroUnidadFuncional]   NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
+            [piso]                 NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
+            [departamento]         NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL
+        );
+
+        DECLARE @PrimeraFila INT = CASE WHEN @HDR = 1 THEN 2 ELSE 1 END;
+        DECLARE @RutaEsc NVARCHAR(4000) = REPLACE(@RutaArchivo, N'''', N'''''');
+        DECLARE @PrimeraFilaTxt NVARCHAR(10) = CONVERT(NVARCHAR(10), @PrimeraFila);
+
+        DECLARE @SqlBulk NVARCHAR(MAX);
+        SET @SqlBulk =
+              N'BULK INSERT #CsvCrudo '
+            + N'FROM ''' + @RutaEsc + N''' '
+            + N'WITH ( '
+            + N' FIRSTROW = ' + @PrimeraFilaTxt
+            + N',FIELDTERMINATOR = ''|'''
+            + N',ROWTERMINATOR   = ''0x0d0a'''
+            + N',CODEPAGE        = ''65001'''
+            + N',KEEPNULLS, TABLOCK );';
+        EXEC (@SqlBulk);
+
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @FilasCsv INT = (SELECT COUNT(*) FROM #CsvCrudo);
+            DECLARE @DetLeidas NVARCHAR(4000) = N'filas_csv=' + CONVERT(NVARCHAR(20), @FilasCsv);
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Archivo leído', @DetLeidas, @RutaArchivo, @LogPath;
+        END
+
+        /* 2) STAGING (normalizo texto y CBU; PB => 0) */
+        IF OBJECT_ID('tempdb..#UF_Stg','U') IS NOT NULL DROP TABLE #UF_Stg;
+        CREATE TABLE #UF_Stg
+        (
+            idUnidadFuncional INT         NULL,  -- puede venir vacío, no lo forzamos
+            nombre            VARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL,
+            piso              TINYINT     NULL,
+            departamento      CHAR(1)     COLLATE DATABASE_DEFAULT NULL,
+            cbu_cvu_norm      CHAR(22)    COLLATE DATABASE_DEFAULT NULL
+        );
+
+        INSERT INTO #UF_Stg (idUnidadFuncional, nombre, piso, departamento, cbu_cvu_norm)
+        SELECT
+            TRY_CONVERT(INT, NULLIF(LTRIM(RTRIM([nroUnidadFuncional])), '')),
+            importacion.fn_LimpiarTexto([Nombre del consorcio], 50),
+            CASE
+                WHEN UPPER(LTRIM(RTRIM([piso]))) IN (N'PB', N'P.B', N'P.B.', N'PLANTA BAJA') THEN 0
+                ELSE TRY_CONVERT(TINYINT, NULLIF(LTRIM(RTRIM([piso])), ''))
+            END,
+            CASE
+                WHEN NULLIF(LTRIM(RTRIM([departamento])), '') IS NULL THEN NULL
+                ELSE SUBSTRING(LTRIM(RTRIM([departamento])), 1, 1)
+            END,
+            CASE
+                WHEN LEN(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                         LTRIM(RTRIM([CVU/CBU])),' ',''),'-',''),'.',''),'/',''),'\',''),'_',''),
+                         '(' ,''),')',''),CHAR(9),''),CHAR(160),'')) = 22
+                 AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                         LTRIM(RTRIM([CVU/CBU])),' ',''),'-',''),'.',''),'/',''),'\',''),'_',''),
+                         '(' ,''),')',''),CHAR(9),''),CHAR(160),'') NOT LIKE '%[^0-9]%'
+                THEN CONVERT(CHAR(22),
+                     REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                     LTRIM(RTRIM([CVU/CBU])),' ',''),'-',''),'.',''),'/',''),'\',''),'_',''),
+                     '(' ,''),')',''),CHAR(9),''),CHAR(160),'')) 
+                ELSE NULL
+            END
+        FROM #CsvCrudo
+        WHERE importacion.fn_LimpiarTexto([Nombre del consorcio], 50) IS NOT NULL;
+
+        /* 3) DEDUP simple */
+        IF OBJECT_ID('tempdb..#UF_Dedup','U') IS NOT NULL DROP TABLE #UF_Dedup;
+        SELECT DISTINCT idUnidadFuncional, nombre, piso, departamento, cbu_cvu_norm
+        INTO #UF_Dedup
+        FROM #UF_Stg;
+
+        /* 4) Asegurar consorcios */
+        INSERT INTO app.Tbl_Consorcio (nombre, direccion, superficieTotal)
+        SELECT d.nombre, NULL, NULL
+        FROM (SELECT DISTINCT nombre FROM #UF_Dedup) d
+        WHERE NOT EXISTS (
+            SELECT 1 FROM app.Tbl_Consorcio c 
+            WHERE c.nombre COLLATE DATABASE_DEFAULT = d.nombre
+        );
+
+        /* 5) ACTUALIZAR UFs existentes
+              a) por idUnidadFuncional si vino en el archivo
+              b) si NO vino id, por match lógico (consorcio + piso + departamento)
+              Siempre cuidando CBU_CVU UNIQUE
+        */
+
+-- a) update por id (idempotente)
+        UPDATE u
+           SET u.piso         = d.piso,
+               u.departamento = d.departamento,
+               u.CBU_CVU      = d.cbu_cvu_norm
+        FROM app.Tbl_UnidadFuncional u
+        JOIN #UF_Dedup d
+          ON d.idUnidadFuncional IS NOT NULL
+         AND d.idUnidadFuncional = u.idUnidadFuncional
+        -- (opcional pero más preciso: asegura que la UF pertenece a ese consorcio)
+        JOIN app.Tbl_Consorcio c
+          ON c.idConsorcio = u.idConsorcio
+         AND c.nombre COLLATE DATABASE_DEFAULT = d.nombre COLLATE DATABASE_DEFAULT
+        WHERE
+            -- cambia piso o departamento
+            ISNULL(u.piso,255) <> ISNULL(d.piso,255)
+         OR ISNULL(u.departamento,'') COLLATE DATABASE_DEFAULT
+            <> ISNULL(d.departamento,'') COLLATE DATABASE_DEFAULT
+         OR (
+              -- cambia CBU y no rompe la unicidad
+              d.cbu_cvu_norm IS NOT NULL
+          AND ISNULL(u.CBU_CVU,'') <> d.cbu_cvu_norm
+          AND NOT EXISTS (
+                SELECT 1
+                FROM app.Tbl_UnidadFuncional x
+                WHERE x.CBU_CVU = d.cbu_cvu_norm
+                  AND x.idUnidadFuncional <> u.idUnidadFuncional
+          )
+         );
+        DECLARE @upd_por_id INT = @@ROWCOUNT;
+
+        -- b) update por (consorcio+piso+depto) cuando NO vino id
+        UPDATE u
+           SET u.CBU_CVU = CASE
+                               WHEN d.cbu_cvu_norm IS NULL THEN u.CBU_CVU
+                               WHEN u.CBU_CVU = d.cbu_cvu_norm THEN u.CBU_CVU
+                               WHEN NOT EXISTS (SELECT 1 FROM app.Tbl_UnidadFuncional x 
+                                                WHERE x.CBU_CVU = d.cbu_cvu_norm
+                                                  AND x.idUnidadFuncional <> u.idUnidadFuncional)
+                               THEN d.cbu_cvu_norm
+                               ELSE u.CBU_CVU
+                           END
+        FROM app.Tbl_UnidadFuncional u
+        JOIN app.Tbl_Consorcio c ON c.idConsorcio = u.idConsorcio
+        JOIN #UF_Dedup d
+          ON d.idUnidadFuncional IS NULL
+         AND c.nombre COLLATE DATABASE_DEFAULT = d.nombre COLLATE DATABASE_DEFAULT
+         AND ISNULL(u.piso,255) = ISNULL(d.piso,255)
+         AND ISNULL(u.departamento,'') COLLATE DATABASE_DEFAULT = ISNULL(d.departamento,'') COLLATE DATABASE_DEFAULT;
+
+        DECLARE @upd_por_match INT = @@ROWCOUNT;
+
+        DECLARE @UFsActualizadas INT = @upd_por_id + @upd_por_match;
+
+        /* 6) INSERTAR UFs nuevas SIN IDENTITY_INSERT
+              Criterio: que NO exista ni por id (si vino) ni por match lógico
+        */
+        INSERT INTO app.Tbl_UnidadFuncional
+            (idConsorcio, piso, departamento, superficie, metrosBaulera, metrosCochera, porcentaje, CBU_CVU)
+        SELECT
+            c.idConsorcio,
+            d.piso,
+            d.departamento,
+            NULL, NULL, NULL, NULL,
+            d.cbu_cvu_norm
+        FROM #UF_Dedup d
+        JOIN app.Tbl_Consorcio c 
+          ON c.nombre COLLATE DATABASE_DEFAULT = d.nombre COLLATE DATABASE_DEFAULT
+        WHERE
+            -- no existe por id (cuando vino id)
+            NOT EXISTS (
+                SELECT 1 FROM app.Tbl_UnidadFuncional u
+                WHERE d.idUnidadFuncional IS NOT NULL
+                  AND u.idUnidadFuncional = d.idUnidadFuncional
+            )
+            -- y no existe por match lógico
+            AND NOT EXISTS (
+                SELECT 1 FROM app.Tbl_UnidadFuncional u
+                WHERE u.idConsorcio = c.idConsorcio
+                  AND ISNULL(u.piso,255) = ISNULL(d.piso,255)
+                  AND ISNULL(u.departamento,'') COLLATE DATABASE_DEFAULT =
+                      ISNULL(d.departamento,'') COLLATE DATABASE_DEFAULT
+            )
+            -- y CBU_CVU libre (si viene)
+            AND (
+                 d.cbu_cvu_norm IS NULL
+              OR NOT EXISTS (SELECT 1 FROM app.Tbl_UnidadFuncional u2 WHERE u2.CBU_CVU = d.cbu_cvu_norm)
+            );
+
+        DECLARE @UFsInsertadas INT = @@ROWCOUNT;
+
+        /* 7) Resumen + log */
+        DECLARE @TotalCsv INT = (SELECT COUNT(*) FROM #CsvCrudo);
+        DECLARE @FilasStg INT = (SELECT COUNT(*) FROM #UF_Stg);
+        DECLARE @FilasDed INT = (SELECT COUNT(*) FROM #UF_Dedup);
+
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @DetalleFin NVARCHAR(4000);
+            SET @DetalleFin = N'csv=' + CONVERT(NVARCHAR(20), @TotalCsv)
+                            + N'; staging=' + CONVERT(NVARCHAR(20), @FilasStg)
+                            + N'; dedup=' + CONVERT(NVARCHAR(20), @FilasDed)
+                            + N'; ufs_upd=' + CONVERT(NVARCHAR(20), @UFsActualizadas)
+                            + N'; ufs_ins=' + CONVERT(NVARCHAR(20), @UFsInsertadas);
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Fin OK', @DetalleFin, @RutaArchivo, @LogPath;
+        END
+
+        SELECT
+            total_csv        = @TotalCsv,
+            procesadas_stg   = @FilasStg,
+            sin_duplicados   = @FilasDed,
+            ufs_actualizadas = @UFsActualizadas,
+            ufs_insertadas   = @UFsInsertadas,
+            mensaje          = N'OK';
+    END TRY
+    BEGIN CATCH
+        DECLARE @MsgError NVARCHAR(4000) = ERROR_MESSAGE();
+        DECLARE @DetErr  NVARCHAR(4000) = N'Error en línea ' + CONVERT(NVARCHAR(10), ERROR_LINE());
+        EXEC reportes.Sp_LogReporte
+            @Procedimiento = @Procedimiento,
+            @Tipo          = 'ERROR',
+            @Mensaje       = @DetErr,
+            @Detalle       = @MsgError,
+            @RutaArchivo   = @RutaArchivo,
+            @RutaLog       = @LogPath;
+        THROW;
+    END CATCH
+END
+GO
+-- //////////////////////////////////////////////////////////////////////
+CREATE OR ALTER PROCEDURE importacion.Sp_CargarUFsDesdeTxt
+    @RutaArchivo    NVARCHAR(4000),
+    @HDR            BIT = 1,
+    @RowTerminator  NVARCHAR(10) = N'0x0d0a',
+    @CodePage       NVARCHAR(16) = N'65001',
+    @LogPath        NVARCHAR(4000) = NULL,
+    @Verbose        BIT = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @Procedimiento SYSNAME = N'importacion.Sp_CargarUFsDesdeTxt';
+
+    BEGIN TRY
+        IF @Verbose = 1
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Inicio del proceso', NULL, @RutaArchivo, @LogPath;
+
+        /* 1) RAW (lectura TXT con tabuladores) */
+        IF OBJECT_ID('tempdb..#RawUF','U') IS NOT NULL DROP TABLE #RawUF;
+        CREATE TABLE #RawUF
+        (
+            [Nombre del consorcio] NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,
+            [nroUnidadFuncional]   NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
+            [Piso]                 NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
+            [departamento]         NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
+            [coeficiente]          NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
+            [m2_unidad_funcional]  NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
+            [bauleras]             NVARCHAR(10)  COLLATE DATABASE_DEFAULT NULL,
+            [cochera]              NVARCHAR(10)  COLLATE DATABASE_DEFAULT NULL,
+            [m2_baulera]           NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
+            [m2_cochera]           NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL
+        );
+
+        DECLARE @PrimeraFila INT = CASE WHEN @HDR = 1 THEN 2 ELSE 1 END;
+        DECLARE @RutaEsc NVARCHAR(4000) = REPLACE(@RutaArchivo, N'''', N'''''');
+
+        DECLARE @SqlBulk NVARCHAR(MAX) =
+            N'BULK INSERT #RawUF FROM ''' + @RutaEsc + N''' ' +
+            N'WITH ( FIRSTROW=' + CONVERT(NVARCHAR(10), @PrimeraFila) +
+            N', FIELDTERMINATOR=''0x09''' +          -- TAB
+            N', ROWTERMINATOR=''' + @RowTerminator + N'''' +
+            N', CODEPAGE='''      + @CodePage      + N'''' +
+            N', KEEPNULLS, TABLOCK );';
+        EXEC (@SqlBulk);
+
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @FilasTxt INT = (SELECT COUNT(*) FROM #RawUF);
+            DECLARE @Det1 NVARCHAR(4000) = N'filas_txt=' + CONVERT(NVARCHAR(20), @FilasTxt);
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Archivo TXT leído',
+                 @Det1, @RutaArchivo, @LogPath;
+        END
+
+        /* 2) STAGING normalizado (una fila por registro del TXT) */
+        IF OBJECT_ID('tempdb..#Stg','U') IS NOT NULL DROP TABLE #Stg;
+        CREATE TABLE #Stg
+        (
+            nombre           VARCHAR(50)   COLLATE DATABASE_DEFAULT NOT NULL,
+            piso             TINYINT       NULL,
+            departamento     CHAR(1)       COLLATE DATABASE_DEFAULT NULL,
+            porcentaje       DECIMAL(5,2)  NULL,
+            superficie       DECIMAL(7,2)  NULL,
+            metrosBaulera    DECIMAL(5,2)  NULL,
+            metrosCochera    DECIMAL(5,2)  NULL
+        );
+
+        INSERT INTO #Stg (nombre, piso, departamento, porcentaje, superficie, metrosBaulera, metrosCochera)
+        SELECT
+            importacion.fn_LimpiarTexto([Nombre del consorcio], 50),
+            CASE WHEN UPPER(LTRIM(RTRIM([Piso]))) IN (N'PB',N'P.B',N'P.B.',N'PLANTA BAJA') THEN 0
+                 ELSE TRY_CONVERT(TINYINT, NULLIF(LTRIM(RTRIM([Piso])),'')) END,
+            CASE WHEN NULLIF(LTRIM(RTRIM([departamento])), '') IS NULL THEN NULL
+                 ELSE SUBSTRING(LTRIM(RTRIM([departamento])), 1, 1) END,
+            importacion.fn_A_Decimal([coeficiente]),
+            importacion.fn_A_Decimal([m2_unidad_funcional]),
+            importacion.fn_A_Decimal([m2_baulera]),
+            importacion.fn_A_Decimal([m2_cochera])
+        FROM #RawUF
+        WHERE importacion.fn_LimpiarTexto([Nombre del consorcio], 50) IS NOT NULL;
+
+        /* 2.b) Consolidación por clave (nombre+piso+depto) para evitar picks no deterministas */
+        IF OBJECT_ID('tempdb..#StgKey','U') IS NOT NULL DROP TABLE #StgKey;
+        ;WITH g AS (
+          SELECT
+            nombre, piso, departamento,
+            MAX(porcentaje)    AS porcentaje,       -- conserva no-nulos
+            MAX(superficie)    AS superficie,
+            MAX(metrosBaulera) AS metrosBaulera,
+            MAX(metrosCochera) AS metrosCochera
+          FROM #Stg
+          GROUP BY nombre, piso, departamento
+        )
+        SELECT nombre, piso, departamento, porcentaje, superficie, metrosBaulera, metrosCochera
+        INTO #StgKey
+        FROM g;
+
+        /* 3) Asegurar Consorcios (comparando nombre normalizado vs normalizado) */
+        INSERT INTO app.Tbl_Consorcio (nombre, direccion, superficieTotal)
+        SELECT DISTINCT k.nombre, NULL, NULL
+        FROM #StgKey k
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM app.Tbl_Consorcio c
+          WHERE importacion.fn_LimpiarTexto(c.nombre, 50) = k.nombre
+        );
+
+        /* 3.b) Mapa (idConsorcio, nombre_normalizado) para joins estables */
+        IF OBJECT_ID('tempdb..#ConsorcioMap','U') IS NOT NULL DROP TABLE #ConsorcioMap;
+        SELECT
+          c.idConsorcio,
+          nom_norm = importacion.fn_LimpiarTexto(c.nombre, 50)
+        INTO #ConsorcioMap
+        FROM app.Tbl_Consorcio c;
+
+        /* 4) UPDATE UFs existentes (idempotente / no pisa con NULL) */
+        UPDATE u
+           SET u.superficie    = k.superficie,
+               u.metrosBaulera = k.metrosBaulera,
+               u.metrosCochera = k.metrosCochera,
+               u.porcentaje    = k.porcentaje
+        FROM app.Tbl_UnidadFuncional u
+        JOIN #ConsorcioMap cm
+          ON cm.idConsorcio = u.idConsorcio
+        JOIN #StgKey k
+          ON k.nombre COLLATE DATABASE_DEFAULT = cm.nom_norm COLLATE DATABASE_DEFAULT
+         AND ISNULL(u.piso,255) = ISNULL(k.piso,255)
+         AND ISNULL(u.departamento,'') COLLATE DATABASE_DEFAULT
+             = ISNULL(k.departamento,'') COLLATE DATABASE_DEFAULT
+        WHERE
+           (k.superficie    IS NOT NULL AND ISNULL(u.superficie    , -0.01) <> k.superficie)
+        OR (k.metrosBaulera IS NOT NULL AND ISNULL(u.metrosBaulera , -0.01) <> k.metrosBaulera)
+        OR (k.metrosCochera IS NOT NULL AND ISNULL(u.metrosCochera , -0.01) <> k.metrosCochera)
+        OR (k.porcentaje    IS NOT NULL AND ISNULL(u.porcentaje    , -0.01) <> k.porcentaje);
+
+        DECLARE @UFsActualizadas INT = @@ROWCOUNT;
+
+        /* 5) INSERT UFs nuevas (una por clave) usando el mismo mapa */
+        INSERT INTO app.Tbl_UnidadFuncional
+          (idConsorcio, piso, departamento, superficie, metrosBaulera, metrosCochera, porcentaje)
+        SELECT
+          cm.idConsorcio, k.piso, k.departamento,
+          k.superficie, k.metrosBaulera, k.metrosCochera, k.porcentaje
+        FROM #StgKey k
+        JOIN #ConsorcioMap cm
+          ON cm.nom_norm COLLATE DATABASE_DEFAULT = k.nombre COLLATE DATABASE_DEFAULT
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM app.Tbl_UnidadFuncional u
+          WHERE u.idConsorcio = cm.idConsorcio
+            AND ISNULL(u.piso,255) = ISNULL(k.piso,255)
+            AND ISNULL(u.departamento,'') COLLATE DATABASE_DEFAULT
+                = ISNULL(k.departamento,'') COLLATE DATABASE_DEFAULT
+        );
+
+        DECLARE @UFsInsertadas INT = @@ROWCOUNT;
+
+        /* 6) Resumen + log */
+        DECLARE @TotTxt INT = (SELECT COUNT(*) FROM #RawUF);
+        DECLARE @TotStg INT = (SELECT COUNT(*) FROM #Stg);
+        DECLARE @TotKey INT = (SELECT COUNT(*) FROM #StgKey);
+
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @DetFin NVARCHAR(4000) =
+                N'txt=' + CONVERT(NVARCHAR(20), @TotTxt) +
+                N'; stg=' + CONVERT(NVARCHAR(20), @TotStg) +
+                N'; stgkey=' + CONVERT(NVARCHAR(20), @TotKey) +
+                N'; ufs_upd=' + CONVERT(NVARCHAR(20), @UFsActualizadas) +
+                N'; ufs_ins=' + CONVERT(NVARCHAR(20), @UFsInsertadas);
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Fin OK',
+                 @DetFin, @RutaArchivo, @LogPath;
+        END
+
+        SELECT
+            filas_txt        = @TotTxt,
+            filas_validas    = @TotStg,
+            claves_unicas    = @TotKey,
+            ufs_actualizadas = @UFsActualizadas,
+            ufs_insertadas   = @UFsInsertadas,
+            mensaje          = N'OK: consolidado por clave; joins por nombre normalizado; sin sobrescribir con NULL';
+    END TRY
+    BEGIN CATCH
+        DECLARE @MsgError NVARCHAR(4000) = ERROR_MESSAGE();
+        DECLARE @DetErr  NVARCHAR(4000) = N'Error en línea ' + CONVERT(NVARCHAR(10), ERROR_LINE());
+        EXEC reportes.Sp_LogReporte
+            @Procedimiento = @Procedimiento,
+            @Tipo          = 'ERROR',
+            @Mensaje       = @DetErr,
+            @Detalle       = @MsgError,
+            @RutaArchivo   = @RutaArchivo,
+            @RutaLog       = @LogPath;
+        THROW;
+    END CATCH
 END
 GO
 
+-- //////////////////////////////////////////////////////////////////////
+CREATE OR ALTER PROCEDURE importacion.Sp_CargarUFInquilinosDesdeCsv
+    @RutaArchivo    NVARCHAR(4000),            -- C:\...\Inquilino-propietarios-datos.csv
+    @HDR            BIT = 1,                   -- 1 = primera fila encabezado
+    @RowTerminator  NVARCHAR(10) = N'0x0d0a',  -- CRLF (usar '0x0a' si solo LF)
+    @CodePage       NVARCHAR(16) = N'ACP',     -- Latin-1; usar '65001' si UTF-8
+    @LogPath        NVARCHAR(4000) = NULL,     -- opcional: archivo .log
+    @Verbose        BIT = 0                    -- 1 = logs INFO
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @Procedimiento SYSNAME = N'importacion.Sp_CargarUFInquilinosDesdeCsv';
+
+    BEGIN TRY
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @Det0 NVARCHAR(4000) = NULL;
+            EXEC reportes.Sp_LogReporte
+                 @Procedimiento = @Procedimiento,
+                 @Tipo          = 'INFO',
+                 @Mensaje       = N'Inicio del proceso',
+                 @Detalle       = @Det0,
+                 @RutaArchivo   = @RutaArchivo,
+                 @RutaLog       = @LogPath;
+        END
+
+        /* 1) RAW del CSV (';') */
+        IF OBJECT_ID('tempdb..#Raw','U') IS NOT NULL DROP TABLE #Raw;
+        CREATE TABLE #Raw
+        (
+            [Nombre]                 NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,
+            [apellido]               NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,
+            [DNI]                    NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL,
+            [email personal]         NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,
+            [telfono de contacto]   NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL, -- viene así
+            [CVU/CBU]                NVARCHAR(64)  COLLATE DATABASE_DEFAULT NULL,
+            [Inquilino]              NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL
+        );
+
+        DECLARE @PrimeraFila INT = CASE WHEN @HDR=1 THEN 2 ELSE 1 END;
+        DECLARE @PrimeraFilaTxt NVARCHAR(10) = CONVERT(NVARCHAR(10), @PrimeraFila);
+        DECLARE @RutaEsc NVARCHAR(4000) = REPLACE(@RutaArchivo, N'''', N'''''');
+
+        DECLARE @SqlBulk NVARCHAR(MAX);
+        SET @SqlBulk = CONCAT(
+            N'BULK INSERT #Raw FROM ''', @RutaEsc, N''' WITH ( ',
+            N'FIRSTROW = ', @PrimeraFilaTxt,
+            N', FIELDTERMINATOR = '';''',
+            N', ROWTERMINATOR  = ''', @RowTerminator, N'''',
+            N', CODEPAGE       = ''', @CodePage, N'''',
+            N', KEEPNULLS, TABLOCK );'
+        );
+
+        EXEC (@SqlBulk);
+
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @FilasRaw INT = (SELECT COUNT(*) FROM #Raw);
+            DECLARE @Det1 NVARCHAR(4000) = CONCAT(N'filas_csv=', CONVERT(NVARCHAR(20), @FilasRaw));
+            EXEC reportes.Sp_LogReporte
+                 @Procedimiento = @Procedimiento,
+                 @Tipo          = 'INFO',
+                 @Mensaje       = N'CSV leído',
+                 @Detalle       = @Det1,
+                 @RutaArchivo   = @RutaArchivo,
+                 @RutaLog       = @LogPath;
+        END
+
+        /* 2) STAGING: normalizar CBU/CVU (22 dígitos) y mapear inquilino */
+        IF OBJECT_ID('tempdb..#Stg','U') IS NOT NULL DROP TABLE #Stg;
+        CREATE TABLE #Stg
+        (
+            cbu_cvu     CHAR(22)     COLLATE DATABASE_DEFAULT NOT NULL,
+            esInquilino BIT          NOT NULL,
+            dni         INT          NULL,
+            nombre      VARCHAR(100) COLLATE DATABASE_DEFAULT NULL,
+            apellido    VARCHAR(100) COLLATE DATABASE_DEFAULT NULL,
+            email       VARCHAR(255) COLLATE DATABASE_DEFAULT NULL,
+            telefono    VARCHAR(50)  COLLATE DATABASE_DEFAULT NULL
+        );
+
+        ;WITH s AS
+        (
+            SELECT
+                cbu_raw = LTRIM(RTRIM([CVU/CBU])),
+                inq_raw = LTRIM(RTRIM([Inquilino])),
+                dni_raw = LTRIM(RTRIM([DNI])),
+                nom_raw = LTRIM(RTRIM([Nombre])),
+                ape_raw = LTRIM(RTRIM([apellido])),
+                mail_raw= LTRIM(RTRIM([email personal])),
+                tel_raw = LTRIM(RTRIM([telfono de contacto]))
+            FROM #Raw
+        ),
+        n AS
+        (
+            SELECT
+                cbu_norm =
+                    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                        s.cbu_raw,' ',''),'-',''),'.',''),'/',''),'\',''),'_',''),
+                        '(' ,''),')',''),CHAR(9),''),CHAR(160),''),
+                inq_norm = LOWER(s.inq_raw),
+                dni_norm = TRY_CONVERT(INT, NULLIF(s.dni_raw,'')),
+                nom_norm = NULLIF(s.nom_raw,''),
+                ape_norm = NULLIF(s.ape_raw,''),
+                mail_norm= NULLIF(s.mail_raw,''),
+                tel_norm =
+                    NULLIF(REPLACE(REPLACE(REPLACE(REPLACE(s.tel_raw,' ',''),'-',''),'(',''),')',''), '')
+            FROM s
+        )
+        INSERT INTO #Stg (cbu_cvu, esInquilino, dni, nombre, apellido, email, telefono)
+        SELECT DISTINCT
+            CONVERT(CHAR(22), n.cbu_norm),
+            CASE 
+                WHEN n.inq_norm COLLATE DATABASE_DEFAULT IN (N'si',N'sí',N'true',N'1',N'inquilino') THEN 1
+                WHEN n.inq_norm COLLATE DATABASE_DEFAULT IN (N'no',N'false',N'0',N'propietario') THEN 0
+            END,
+            n.dni_norm,
+            CASE WHEN n.nom_norm  IS NULL THEN NULL ELSE LEFT(n.nom_norm ,100) END,
+            CASE WHEN n.ape_norm  IS NULL THEN NULL ELSE LEFT(n.ape_norm ,100) END,
+			CASE
+                WHEN n.mail_norm IS NULL THEN NULL
+                WHEN importacion.fn_EmailValido(n.mail_norm) = 1
+                     THEN LEFT(n.mail_norm, 255)
+                ELSE NULL
+            END,
+			CASE WHEN n.tel_norm  IS NULL THEN NULL ELSE LEFT(n.tel_norm ,50)  END
+        FROM n
+        WHERE n.cbu_norm IS NOT NULL
+          AND LEN(n.cbu_norm)=22
+          AND n.cbu_norm NOT LIKE '%[^0-9]%'
+          AND n.inq_norm IS NOT NULL
+          AND n.inq_norm COLLATE DATABASE_DEFAULT IN
+              (N'si',N'sí',N'true',N'1',N'inquilino', N'no',N'false',N'0',N'propietario');
+
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @FilasStg INT = (SELECT COUNT(*) FROM #Stg);
+            DECLARE @Det2 NVARCHAR(4000) = CONCAT(N'filas_stg_validas=', CONVERT(NVARCHAR(20), @FilasStg));
+            EXEC reportes.Sp_LogReporte
+                 @Procedimiento = @Procedimiento,
+                 @Tipo          = 'INFO',
+                 @Mensaje       = N'STG listo',
+                 @Detalle       = @Det2,
+                 @RutaArchivo   = @RutaArchivo,
+                 @RutaLog       = @LogPath;
+        END
+
+        /* 3) INSERTAR faltantes en app.Tbl_Persona (usa IDX_CVU_CBU_PERSONA) */
+        DECLARE @ColsTarget NVARCHAR(MAX) = N'CBU_CVU';
+        DECLARE @ColsSource NVARCHAR(MAX) = N's.cbu_cvu';
+
+        IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'dni')
+        BEGIN
+            SET @ColsTarget = CONCAT(@ColsTarget, N', dni');
+            SET @ColsSource = CONCAT(@ColsSource, N', s.dni');
+        END
+
+        IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'nombre')
+        BEGIN
+            SET @ColsTarget = CONCAT(@ColsTarget, N', nombre');
+            SET @ColsSource = CONCAT(@ColsSource, N', s.nombre');
+        END
+
+        IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'apellido')
+        BEGIN
+            SET @ColsTarget = CONCAT(@ColsTarget, N', apellido');
+            SET @ColsSource = CONCAT(@ColsSource, N', s.apellido');
+        END
+
+        IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'email')
+        BEGIN
+            SET @ColsTarget = CONCAT(@ColsTarget, N', email');
+            SET @ColsSource = CONCAT(@ColsSource, N', s.email');
+        END
+
+        IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'telefono')
+        BEGIN
+            SET @ColsTarget = CONCAT(@ColsTarget, N', telefono');
+            SET @ColsSource = CONCAT(@ColsSource, N', s.telefono');
+        END
+
+        DECLARE @SqlInsPer NVARCHAR(MAX) =
+    CONCAT(
+        N'INSERT INTO app.Tbl_Persona (', @ColsTarget, N') ',
+        N'SELECT ', @ColsSource, N' ',
+        N'FROM #Stg s ',
+        N'WHERE NOT EXISTS (SELECT 1 FROM app.Tbl_Persona p WHERE p.CBU_CVU = s.cbu_cvu);'
+    );
+
+        EXEC (@SqlInsPer);
+
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @NuevasPersonas INT =
+                (SELECT COUNT(*) FROM #Stg s
+                 WHERE NOT EXISTS (SELECT 1 FROM app.Tbl_Persona p WHERE p.CBU_CVU = s.cbu_cvu));
+            DECLARE @Det3 NVARCHAR(4000) = CONCAT(N'personas_nuevas=', CONVERT(NVARCHAR(20), @NuevasPersonas));
+            EXEC reportes.Sp_LogReporte
+                 @Procedimiento = @Procedimiento,
+                 @Tipo          = 'INFO',
+                 @Mensaje       = N'Personas insertadas (faltantes)',
+                 @Detalle       = @Det3,
+                 @RutaArchivo   = @RutaArchivo,
+                 @RutaLog       = @LogPath;
+        END
+
+        /* 4) VINCULAR Persona y Consorcio por el MISMO CBU_CVU y upsert en UFPersona (sin idUnidadFuncional) */
+IF OBJECT_ID('tempdb.#MatchCBU','U') IS NOT NULL DROP TABLE #MatchCBU;
+CREATE TABLE #MatchCBU
+(
+    idPersona    INT NOT NULL,
+    idConsorcio  INT NOT NULL,
+    esInquilino  BIT NOT NULL
+);
+
+INSERT INTO #MatchCBU (idPersona, idConsorcio, esInquilino)
+SELECT
+    p.idPersona,
+    u.idConsorcio,
+    s.esInquilino
+FROM #Stg s
+JOIN app.Tbl_Persona p ON p.CBU_CVU = s.cbu_cvu
+JOIN app.Tbl_UnidadFuncional u WITH (INDEX = UQ_UnidadFuncional_CBU_CVU) ON u.CBU_CVU = s.cbu_cvu;
+
+IF @Verbose = 1
+BEGIN
+    DECLARE @Det4 NVARCHAR(4000) = CONCAT(N'matcheos_cbu=', (SELECT COUNT(*) FROM #MatchCBU));
+    EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Match Persona↔Consorcio por CBU', @Det4, @RutaArchivo, @LogPath;
+END
+
+-- UPDATE si ya existe (idPersona + idConsorcio)
+UPDATE uf
+   SET uf.esInquilino = m.esInquilino
+FROM app.Tbl_UFPersona uf
+JOIN #MatchCBU m
+  ON m.idPersona = uf.idPersona
+ AND m.idConsorcio = uf.idConsorcio;
+
+DECLARE @RowsUpd INT = @@ROWCOUNT;
+
+-- INSERT si no existe (idPersona + idConsorcio)
+INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino)
+SELECT m.idPersona, m.idConsorcio, m.esInquilino,
+FROM #MatchCBU m
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM app.Tbl_UFPersona uf
+    WHERE uf.idPersona   = m.idPersona
+      AND uf.idConsorcio = m.idConsorcio
+);
+
+DECLARE @RowsIns INT = @@ROWCOUNT;
+
+        /* 5) Resumen */
+        DECLARE @TotCsv INT = (SELECT COUNT(*) FROM #Raw);
+        DECLARE @TotStg INT = (SELECT COUNT(*) FROM #Stg);
+        DECLARE @TotMatchCBU INT = (SELECT COUNT(*) FROM #MatchCBU);
+
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @Det5 NVARCHAR(4000) =
+                CONCAT(N'csv=', @TotCsv,
+                       N'; stg=', @TotStg,
+                       N'; match_cbu=', @TotMatchCBU,
+                       N'; uf_upd=', @RowsUpd,
+                       N'; uf_ins=', @RowsIns);
+            EXEC reportes.Sp_LogReporte
+                 @Procedimiento = @Procedimiento,
+                 @Tipo          = 'INFO',
+                 @Mensaje       = N'Fin OK',
+                 @Detalle       = @Det5,
+                 @RutaArchivo   = @RutaArchivo,
+                 @RutaLog       = @LogPath;
+        END
+
+        SELECT
+            filas_csv_total           = @TotCsv,
+            filas_validas_stg         = @TotStg,
+            vinculos_por_cbu          = @TotMatchCBU,
+            uf_actualizadas           = @RowsUpd,
+            uf_insertadas             = @RowsIns,
+            mensaje                   = N'OK';
+    END TRY
+    BEGIN CATCH
+        DECLARE @MsgError NVARCHAR(4000) = ERROR_MESSAGE();
+        DECLARE @DetErr NVARCHAR(4000) = CONCAT(N'Error en línea ', CONVERT(NVARCHAR(10), ERROR_LINE()));
+        EXEC reportes.Sp_LogReporte
+            @Procedimiento = @Procedimiento,
+            @Tipo          = 'ERROR',
+            @Mensaje       = @DetErr,
+            @Detalle       = @MsgError,
+            @RutaArchivo   = @RutaArchivo,
+            @RutaLog       = @LogPath;
+        THROW;
+    END CATCH
+END
+GO
+-- //////////////////////////////////////////////////////////////////////
 CREATE OR ALTER PROCEDURE importacion.Sp_CargarPagosDesdeCsv
     @RutaArchivo      NVARCHAR(4000),
     @HDR              BIT           = 1,
@@ -1507,7 +1332,7 @@ BEGIN
 
         CREATE TABLE #pagos (
             fecha       DATE          NOT NULL,
-            CBU_CVU     VARCHAR(22)   COLLATE DATABASE_DEFAULT NOT NULL,
+            CBU_CVU     CHAR(22)      COLLATE DATABASE_DEFAULT NOT NULL,
             valor       DECIMAL(10,2) NOT NULL
         );
 
@@ -1573,30 +1398,12 @@ BEGIN
         ;WITH pre AS (
             SELECT
                 fecha_txt,
-                cbu_txt,
-                valor_txt,
-                LTRIM(RTRIM(REPLACE(
-                    REPLACE(REPLACE(valor_txt, NCHAR(160), N' '), CHAR(9), N' '),
-                    N'$',''
-                ))) AS v0
+                /* limpio CBU de separadores comunes y espacios/tab/NBSP */
+                REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(cbu_txt)),
+                    NCHAR(160),N''), CHAR(9), N''), ' ', ''), '.', ''), '-', '') AS cbu_clean,
+                /* recorto símbolos de moneda y espacios raros */
+                LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(valor_txt, NCHAR(160), N' '), CHAR(9), N' '), N'$',''))) AS valor_clean
             FROM #norm
-        ),
-        norm_val AS (
-            SELECT
-                fecha_txt,
-                cbu_txt,
-                valor_txt,
-                REPLACE(REPLACE(v0, N'.', N''), N',', N'.') AS v1
-            FROM pre
-        ),
-        recorte AS (
-            SELECT
-                fecha_txt, cbu_txt, valor_txt,
-                CASE WHEN CHARINDEX(' ', v1) > 0
-                     THEN LEFT(v1, CHARINDEX(' ', v1)-1)
-                     ELSE v1
-                END AS v_num_txt
-            FROM norm_val
         ),
         parsed AS (
             SELECT
@@ -1605,16 +1412,19 @@ BEGIN
                     TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(fecha_txt)),''), 120), -- yyyy-mm-dd
                     TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(fecha_txt)),''))      -- genérico
                 ) AS fecha,
-                LEFT(LTRIM(RTRIM(cbu_txt)), 22) AS CBU_CVU,
-                TRY_CONVERT(decimal(10,2), v_num_txt) AS valor
-            FROM recorte
+                /* pad-left a 22 */
+                CAST(RIGHT(CONCAT(REPLICATE('0',22), cbu_clean), 22) AS CHAR(22)) AS CBU_CVU,
+                /* parser flexible: soporta 12.345,67 y 12,345.67 */
+                importacion.fn_ParseImporteFlexible(NULLIF(valor_clean, N''))     AS valor
+            FROM pre
         )
         INSERT INTO #pagos (fecha, CBU_CVU, valor)
         SELECT fecha, CBU_CVU, valor
         FROM parsed
         WHERE fecha IS NOT NULL
           AND valor IS NOT NULL
-          AND NULLIF(CBU_CVU,'') IS NOT NULL;
+          AND CBU_CVU IS NOT NULL
+          AND CBU_CVU <> REPLICATE('0',22);  -- evita CBUs vacíos formateados
 
         DECLARE @FilasPagos INT = (SELECT COUNT(*) FROM #pagos);
         IF @Verbose = 1
@@ -1634,7 +1444,11 @@ BEGIN
         WHERE NOT EXISTS (
             SELECT 1
             FROM #pagos p
-            WHERE p.CBU_CVU = LEFT(LTRIM(RTRIM(n.cbu_txt)), 22)
+            WHERE p.CBU_CVU = CAST(
+                     RIGHT(CONCAT(REPLICATE('0',22),
+                                  REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(n.cbu_txt)),
+                                        NCHAR(160),N''), CHAR(9), N''), ' ', ''), '.', ''), '-', '')
+                     ), 22) AS CHAR(22))
               AND p.fecha = COALESCE(
                                 TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(n.fecha_txt)),''), 103),
                                 TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(n.fecha_txt)),''), 120),
@@ -1642,26 +1456,17 @@ BEGIN
         );
 
         DECLARE @ErroresParseo INT = (SELECT COUNT(*) FROM #errores);
-        IF @ErroresParseo > 0 AND @Verbose = 1
-        BEGIN
-            DECLARE @DetErrParseo NVARCHAR(4000) =
-                CONCAT(N'filas_invalidas=', CONVERT(NVARCHAR(20), @ErroresParseo));
-            EXEC reportes.Sp_LogReporte @Procedimiento, 'WARN',
-                 N'Filas descartadas por parseo', @DetErrParseo, @RutaArchivo, @LogPath;
-        END
 
-        /* =============================== 4) Enriquecer (Persona/UF/Consorcio/Expensa) =============================== */
+        /* =============================== 4) Enriquecer (UF/Consorcio/Expensa) =============================== */
         ;WITH pagos_enriq AS
         (
             SELECT
                 p.fecha,
                 p.valor                AS monto,
                 p.CBU_CVU,
-                per.idPersona,
                 uf.idUnidadFuncional,
                 uf.idConsorcio
             FROM #pagos p
-            LEFT JOIN app.Tbl_Persona         per ON per.CBU_CVU = p.CBU_CVU
             LEFT JOIN app.Tbl_UnidadFuncional uf
                    ON uf.CBU_CVU = p.CBU_CVU
         )
@@ -1682,11 +1487,10 @@ BEGIN
             ORDER BY e.fechaGeneracion DESC, e.nroExpensa DESC
         ) e;
 
-        /* Registrar faltantes de mapeo (persona/UF/consorcio/expensa) */
+        /* Registrar faltantes de mapeo (UF/consorcio/expensa) */
         INSERT INTO #errores (motivo, fecha_txt, cbu_txt, valor_txt)
         SELECT
             CASE 
-              WHEN idPersona IS NULL         THEN N'CBU no existe en Tbl_Persona'
               WHEN idUnidadFuncional IS NULL THEN N'No se encontró UF para ese CBU'
               WHEN idConsorcio IS NULL       THEN N'No se determinó Consorcio'
               WHEN nroExpensa IS NULL        THEN N'No hay expensa del mes para el consorcio'
@@ -1695,8 +1499,7 @@ BEGIN
             CBU_CVU,
             CONVERT(NVARCHAR(40), monto)
         FROM #pagos_completos
-        WHERE idPersona IS NULL
-           OR idUnidadFuncional IS NULL
+        WHERE idUnidadFuncional IS NULL
            OR idConsorcio IS NULL
            OR nroExpensa IS NULL;
 
@@ -1708,8 +1511,7 @@ BEGIN
             p.CBU_CVU,
             CONVERT(NVARCHAR(40), p.monto)
         FROM #pagos_completos p
-        WHERE p.idPersona IS NOT NULL
-          AND p.idUnidadFuncional IS NOT NULL
+        WHERE p.idUnidadFuncional IS NOT NULL
           AND p.idConsorcio IS NOT NULL
           AND p.nroExpensa IS NOT NULL
           AND NOT EXISTS (
@@ -1723,11 +1525,10 @@ BEGIN
         /* Filas válidas (con mapeo completo Y EstadoCuenta existente) */
         IF OBJECT_ID('tempdb..#ok') IS NOT NULL DROP TABLE #ok;
 
-        SELECT
+        SELECT DISTINCT   -- evita duplicados si el CSV repite filas
             p.fecha,
             p.monto,
             p.CBU_CVU,
-            p.idPersona,
             p.idUnidadFuncional,
             p.idConsorcio,
             p.nroExpensa,
@@ -1738,73 +1539,96 @@ BEGIN
           ON ec.nroUnidadFuncional = p.idUnidadFuncional
          AND ec.idConsorcio       = p.idConsorcio
          AND ec.nroExpensa        = p.nroExpensa
-        WHERE p.idPersona IS NOT NULL
-          AND p.idUnidadFuncional IS NOT NULL
+        WHERE p.idUnidadFuncional IS NOT NULL
           AND p.idConsorcio IS NOT NULL
           AND p.nroExpensa IS NOT NULL;
 
-        /* Errores de matching */
         DECLARE @ErroresMatch       INT = (SELECT COUNT(*) FROM #errores) - @ErroresParseo;
-        DECLARE @FilasOK           INT = (SELECT COUNT(*) FROM #ok);
-        DECLARE @PagosNoAsociados  INT = (SELECT COUNT(*) FROM #errores);
-
-        IF @ErroresMatch > 0 AND @Verbose = 1
-        BEGIN
-            DECLARE @DetErrMatch NVARCHAR(4000) =
-                CONCAT(N'falla_match=', CONVERT(NVARCHAR(20), @ErroresMatch));
-            EXEC reportes.Sp_LogReporte @Procedimiento, 'WARN',
-                 N'Filas sin mapping completo', @DetErrMatch, @RutaArchivo, @LogPath;
-        END
+        DECLARE @FilasOK            INT = (SELECT COUNT(*) FROM #ok);
+        DECLARE @PagosNoAsociados   INT = (SELECT COUNT(*) FROM #errores);
 
         IF @Verbose = 1
         BEGIN
-            DECLARE @DetOK NVARCHAR(4000) =
+            IF @ErroresMatch > 0
+            BEGIN
+                DECLARE @DetErrMatchMsg NVARCHAR(4000) =
+                    CONCAT(N'falla_match=', CONVERT(NVARCHAR(20), @ErroresMatch));
+                EXEC reportes.Sp_LogReporte @Procedimiento, 'WARN',
+                     N'Filas sin mapping completo', @DetErrMatchMsg, @RutaArchivo, @LogPath;
+            END;
+
+            DECLARE @DetOkMsg NVARCHAR(4000) =
                 CONCAT(N'pagos_ok=', CONVERT(NVARCHAR(20), @FilasOK));
             EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO',
-                 N'Filas listas para inserción', @DetOK, @RutaArchivo, @LogPath;
+                 N'Filas listas para inserción', @DetOkMsg, @RutaArchivo, @LogPath;
         END
 
-        /* =============================== 4.b) Persistir pagos no asociados =============================== */
-        IF OBJECT_ID('importacion.Tbl_PagoNoAsociado', 'U') IS NOT NULL
+        /* =============================== 4.b) Pagos no asociados (idempotente) =============================== */
+        IF OBJECT_ID('importacion.Tbl_Pago_No_Asociado', 'U') IS NOT NULL
         BEGIN
-            INSERT INTO importacion.Tbl_PagoNoAsociado
+            INSERT INTO importacion.Tbl_Pago_No_Asociado
                 (motivo, fecha_txt, cbu_txt, valor_txt, rutaArchivo)
-            SELECT
-                motivo, fecha_txt, cbu_txt, valor_txt, @RutaArchivo
-            FROM #errores;
+            SELECT e.motivo, e.fecha_txt, e.cbu_txt, e.valor_txt, @RutaArchivo
+            FROM #errores e
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM importacion.Tbl_Pago_No_Asociado x
+                WHERE x.motivo      = e.motivo
+                  AND x.fecha_txt   = e.fecha_txt
+                  AND x.cbu_txt     = e.cbu_txt
+                  AND x.valor_txt   = e.valor_txt
+                  AND x.rutaArchivo = @RutaArchivo
+            );
 
             IF @Verbose = 1
             BEGIN
-                DECLARE @DetNoAsoc NVARCHAR(4000) =
+                DECLARE @DetNoAsocMsg NVARCHAR(4000) =
                     CONCAT(N'pagos_no_asociados=', CONVERT(NVARCHAR(20), @PagosNoAsociados));
                 EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO',
-                     N'Pagos no asociados registrados', @DetNoAsoc, @RutaArchivo, @LogPath;
+                     N'Pagos no asociados registrados', @DetNoAsocMsg, @RutaArchivo, @LogPath;
             END
-        END
+        END  -- <<<<<< ¡Este END faltaba y rompía el TRY/CATCH! >>>>>>
 
-        /* =============================== 5) SOLO PAGOS (NO crea EstadoCuenta) =============================== */
-        INSERT INTO app.Tbl_Pago
-            (idEstadoCuenta, nroUnidadFuncional, idConsorcio, nroExpensa,
-             fecha, monto, CBU_CVU)
-        SELECT
-            o.idEstadoCuenta,
-            o.idUnidadFuncional,
-            o.idConsorcio,
-            o.nroExpensa,
-            o.fecha,
-            o.monto,
-            o.CBU_CVU
-        FROM #ok o
-        OPTION (USE HINT('DISABLE_OPTIMIZED_PLAN_FORCING'));
+        /* =============================== 5) INSERTAR PAGOS (IDEMPOTENTE) =============================== */
+        IF OBJECT_ID('tempdb..#merge_out_pagos') IS NOT NULL DROP TABLE #merge_out_pagos;
+        CREATE TABLE #merge_out_pagos (accion NVARCHAR(10));
 
-        DECLARE @PagosInsertados INT = @@ROWCOUNT;
+        ;WITH src AS (
+            SELECT
+                o.idEstadoCuenta,
+                o.idUnidadFuncional AS nroUnidadFuncional,
+                o.idConsorcio,
+                o.nroExpensa,
+                o.fecha,
+                o.monto,
+                o.CBU_CVU
+            FROM #ok o
+        )
+        MERGE app.Tbl_Pago AS T
+        USING src AS S
+           ON  T.idEstadoCuenta     = S.idEstadoCuenta
+           AND T.nroUnidadFuncional = S.nroUnidadFuncional
+           AND T.idConsorcio        = S.idConsorcio
+           AND T.nroExpensa         = S.nroExpensa
+           AND T.fecha              = S.fecha
+           AND T.monto              = S.monto
+           AND T.CBU_CVU            = S.CBU_CVU
+        WHEN NOT MATCHED THEN
+            INSERT (idEstadoCuenta, nroUnidadFuncional, idConsorcio, nroExpensa,
+                    fecha, monto, CBU_CVU)
+            VALUES (S.idEstadoCuenta, S.nroUnidadFuncional, S.idConsorcio, S.nroExpensa,
+                    S.fecha, S.monto, S.CBU_CVU)
+        OUTPUT $action INTO #merge_out_pagos;
+
+        DECLARE @PagosInsertados INT =
+            (SELECT COUNT(*) FROM #merge_out_pagos WHERE accion = 'INSERT');
 
         IF @Verbose = 1
         BEGIN
-            DECLARE @DetPago NVARCHAR(4000) =
+            DECLARE @DetInsMsg NVARCHAR(4000) =
                 CONCAT(N'pagos_insertados=', CONVERT(NVARCHAR(20), @PagosInsertados));
             EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO',
-                 N'Pagos insertados', @DetPago, @RutaArchivo, @LogPath;
+                 N'Pagos insertados (idempotente)', @DetInsMsg, @RutaArchivo, @LogPath;
         END
 
         /* =============================== 6) Resumen =============================== */
@@ -1818,7 +1642,473 @@ BEGIN
                 N'; errores_match=', @ErroresMatch,
                 N'; pagos_no_asociados=', @PagosNoAsociados,
                 N'; pagos_listos=', @FilasOK,
-                N'; pagos_ins=', @PagosInsertados
+                N'; pagos_ins_total(tras merge)=', @PagosInsertados
+            );
+
+        IF @Verbose = 1
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO',
+                 N'Fin OK', @Resumen, @RutaArchivo, @LogPath;
+
+        SELECT
+            filas_raw             = @FilasRaw,
+            filas_norm            = @FilasNorm,
+            pagos_validos         = @FilasPagos,
+            errores_parseo        = @ErroresParseo,
+            errores_match         = @ErroresMatch,
+            pagos_no_asociados    = @PagosNoAsociados,
+            pagos_listos          = @FilasOK,
+            pagos_insertados      = @PagosInsertados,
+            mensaje               = N'OK';
+    END TRY
+    BEGIN CATCH
+        DECLARE @MsgError NVARCHAR(4000) = ERROR_MESSAGE();
+        DECLARE @DetErr  NVARCHAR(4000) =
+            CONCAT(N'Error en línea ', CONVERT(NVARCHAR(10), ERROR_LINE()));
+        EXEC reportes.Sp_LogReporte
+            @Procedimiento = @Procedimiento,
+            @Tipo          = 'ERROR',
+            @Mensaje       = @DetErr,
+            @Detalle       = @MsgError,
+            @RutaArchivo   = @RutaArchivo,
+            @RutaLog       = @LogPath;
+        THROW; -- correcto: dentro del CATCH
+    END CATCH
+END
+GO
+
+
+-- //////////////////////////////////////////////////////////////////////
+-- Cargar un insert de lote de expensas y estado cuenta
+-- //////////////////////////////////////////////////////////////////////
+IF OBJECT_ID('importacion.Tbl_Pago_No_Asociado', 'U') IS NULL
+BEGIN
+    CREATE TABLE importacion.Tbl_Pago_No_Asociado
+    (
+        idPagoNoAsociado INT IDENTITY(1,1) PRIMARY KEY,
+        fechaRegistro    DATETIME2(0) NOT NULL CONSTRAINT DF_PagoNoAsoc_fechaRegistro DEFAULT SYSDATETIME(),
+        motivo           NVARCHAR(200)  COLLATE DATABASE_DEFAULT NULL,
+        fecha_txt        NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+        cbu_txt          NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+        valor_txt        NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+        rutaArchivo      NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL
+    );
+END
+GO
+
+CREATE OR ALTER PROCEDURE importacion.Sp_CargarPagosDesdeCsv
+    @RutaArchivo      NVARCHAR(4000),
+    @HDR              BIT           = 1,
+    @Separador        CHAR(1)       = ',',
+    @RowTerminator    NVARCHAR(10)  = N'0x0d0a',
+    @CodePage         NVARCHAR(16)  = N'65001',
+    @LogPath          NVARCHAR(4000) = NULL,
+    @Verbose          BIT           = 1
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @Procedimiento SYSNAME = N'importacion.Sp_CargarPagosDesdeCsv';
+
+    BEGIN TRY
+        /* =============================== 0) INICIO =============================== */
+        IF @Verbose = 1
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO',
+                 N'Inicio del proceso', NULL, @RutaArchivo, @LogPath;
+
+        /* Limpieza previa */
+        IF OBJECT_ID('tempdb..#raw')             IS NOT NULL DROP TABLE #raw;
+        IF OBJECT_ID('tempdb..#norm')            IS NOT NULL DROP TABLE #norm;
+        IF OBJECT_ID('tempdb..#pagos')           IS NOT NULL DROP TABLE #pagos;
+        IF OBJECT_ID('tempdb..#errores')         IS NOT NULL DROP TABLE #errores;
+        IF OBJECT_ID('tempdb..#pagos_completos') IS NOT NULL DROP TABLE #pagos_completos;
+        IF OBJECT_ID('tempdb..#ok')              IS NOT NULL DROP TABLE #ok;
+
+        /* Tablas temporales */
+        CREATE TABLE #raw (
+            c1 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+            c2 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+            c3 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+            c4 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+            c5 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+            c6 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL
+        );
+
+        CREATE TABLE #norm (
+            id_norm     INT IDENTITY(1,1) PRIMARY KEY,
+            id_pago_txt NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+            fecha_txt   NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+            cbu_txt     NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
+            valor_txt   NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL
+        );
+
+        CREATE TABLE #pagos (
+            id_norm     INT           NOT NULL,
+            fecha       DATE          NOT NULL,
+            CBU_CVU     CHAR(22)      COLLATE DATABASE_DEFAULT NOT NULL,
+            valor       DECIMAL(12,2) NOT NULL  -- un pelín más amplio
+        );
+
+        CREATE TABLE #errores (
+            motivo      NVARCHAR(200)  COLLATE DATABASE_DEFAULT,
+            fecha_txt   NVARCHAR(4000) COLLATE DATABASE_DEFAULT,
+            cbu_txt     NVARCHAR(4000) COLLATE DATABASE_DEFAULT,
+            valor_txt   NVARCHAR(4000) COLLATE DATABASE_DEFAULT
+        );
+
+        /* =============================== 1) BULK =============================== */
+        DECLARE @PrimeraFila INT = CASE WHEN @HDR = 1 THEN 2 ELSE 1 END;
+        DECLARE @RutaEsc NVARCHAR(4000) = REPLACE(@RutaArchivo, N'''', N'''''');
+
+        DECLARE @SqlBulk NVARCHAR(MAX) =
+            CONCAT(
+                N'BULK INSERT #raw FROM ''', @RutaEsc, N''' WITH (',
+                N' FIRSTROW = ', CONVERT(NVARCHAR(10), @PrimeraFila),
+                N', FIELDTERMINATOR = ''', @Separador, N'''',
+                N', ROWTERMINATOR  = ''', @RowTerminator, N'''',
+                N', CODEPAGE       = ''', @CodePage, N'''',
+                N', TABLOCK );'
+            );
+
+        BEGIN TRY
+            EXEC (@SqlBulk);
+        END TRY
+        BEGIN CATCH
+            DECLARE @Emsg NVARCHAR(4000) = ERROR_MESSAGE();
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'ERROR',
+                 N'BULK INSERT', @Emsg, @RutaArchivo, @LogPath;
+            THROW;
+        END CATCH
+
+        DECLARE @FilasRaw INT = (SELECT COUNT(*) FROM #raw);
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @DetRaw NVARCHAR(4000) =
+                CONCAT(N'filas_raw=', CONVERT(NVARCHAR(20), @FilasRaw));
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO',
+                 N'CSV leído', @DetRaw, @RutaArchivo, @LogPath;
+        END
+
+        /* =============================== 2) Normalización =============================== */
+        INSERT INTO #norm (id_pago_txt, fecha_txt, cbu_txt, valor_txt)
+        SELECT
+            CASE WHEN NULLIF(LTRIM(RTRIM(c4)),'') IS NOT NULL THEN c1 ELSE NULL END,
+            CASE WHEN NULLIF(LTRIM(RTRIM(c4)),'') IS NOT NULL THEN c2 ELSE c1 END,
+            CASE WHEN NULLIF(LTRIM(RTRIM(c4)),'') IS NOT NULL THEN c3 ELSE c2 END,
+            CASE WHEN NULLIF(LTRIM(RTRIM(c4)),'') IS NOT NULL THEN c4 ELSE c3 END
+        FROM #raw;
+
+        DECLARE @FilasNorm INT = (SELECT COUNT(*) FROM #norm);
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @DetNorm NVARCHAR(4000) =
+                CONCAT(N'filas_norm=', CONVERT(NVARCHAR(20), @FilasNorm));
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO',
+                 N'Normalización lista', @DetNorm, @RutaArchivo, @LogPath;
+        END
+
+        /* =============================== 3) Parseo -> #pagos =============================== */
+        /* =============================== 3) Parseo -> #pagos =============================== */
+        ;WITH pre AS (
+            SELECT
+                n.id_norm,
+                n.fecha_txt,
+                /* limpio CBU de separadores comunes y espacios/tab/NBSP */
+                REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(UPPER(LTRIM(RTRIM(n.cbu_txt))),
+                    NCHAR(160),N''), CHAR(9), N''), ' ', ''), '.', ''), '-', '') AS cbu_clean,
+                /* normalizo texto de valor: saco moneda y quotes, preservo paréntesis p/negativos */
+                UPPER(LTRIM(RTRIM(
+                    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(n.valor_txt,
+                        NCHAR(160), N' '), CHAR(9), N' '), 'AR$', ''), 'ARS', ''), 'U$S', ''), '$',''), '"','')
+                ))) AS v0
+            FROM #norm n
+        ),
+        negfix AS (
+            /* detecto paréntesis: “(123,45)” => negativo */
+            SELECT
+                id_norm,
+                fecha_txt,
+                cbu_clean,
+                CASE WHEN v0 LIKE '(%' AND v0 LIKE '%)' THEN 1 ELSE 0 END AS es_neg,
+                /* quito paréntesis si los hubiera */
+                REPLACE(REPLACE(v0,'(','') ,')','') AS v1
+            FROM pre
+        ),
+        sincar AS (
+            /* quito espacios */
+            SELECT
+                id_norm,
+                fecha_txt,
+                cbu_clean,
+                es_neg,
+                REPLACE(v1,' ','') AS v2
+            FROM negfix
+        ),
+        cands AS (
+            /* genero 3 candidatos de interpretación */
+            SELECT
+                id_norm,
+                fecha_txt,
+                cbu_clean,
+                es_neg,
+                v2,
+                -- A) coma decimal: 1.234,56 => 1234.56
+                REPLACE(REPLACE(v2, '.', ''), ',', '.') AS cand_coma,
+                -- B) punto decimal: 12,345.67 => 12345.67
+                REPLACE(REPLACE(v2, ',', ''), '.', '.') AS cand_punto,
+                -- C) sin separadores: 1.234.567 => 1234567
+                REPLACE(REPLACE(v2, '.', ''), ',', '') AS cand_sin
+            FROM sincar
+        ),
+        decpos AS (
+            /* posición del punto en cada candidato para validar “dos decimales” */
+            SELECT
+                id_norm, fecha_txt, cbu_clean, es_neg, v2, cand_coma, cand_punto, cand_sin,
+                CASE WHEN CHARINDEX('.', cand_coma)  > 0
+                     THEN LEN(cand_coma)  - CHARINDEX('.', REVERSE(cand_coma))  END AS dec2_coma,
+                CASE WHEN CHARINDEX('.', cand_punto) > 0
+                     THEN LEN(cand_punto) - CHARINDEX('.', REVERSE(cand_punto)) END AS dec2_punto
+            FROM cands
+        ),
+        parsed AS (
+            SELECT
+                n.id_norm,
+                /* fechas: dd/mm/yyyy, yyyy-mm-dd, genérico */
+                COALESCE(
+                    TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(n.fecha_txt)),''), 103),
+                    TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(n.fecha_txt)),''), 120),
+                    TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(n.fecha_txt)),''))      
+                ) AS fecha,
+
+                /* CBU pad-left a 22 */
+                CAST(RIGHT(CONCAT(REPLICATE('0',22), n.cbu_clean), 22) AS CHAR(22)) AS CBU_CVU,
+
+                /* monto: priorizo el candidato cuyo decimal tiene exactamente 2 dígitos */
+                COALESCE(
+                    CASE WHEN n.dec2_punto = 2
+                         THEN TRY_CONVERT(DECIMAL(12,2), CASE WHEN n.es_neg=1 THEN '-' + n.cand_punto ELSE n.cand_punto END)
+                    END,
+                    CASE WHEN n.dec2_coma = 2
+                         THEN TRY_CONVERT(DECIMAL(12,2), CASE WHEN n.es_neg=1 THEN '-' + n.cand_coma ELSE n.cand_coma END)
+                    END,
+                    /* si no hubo match “2 decimales”, intento ambos igual */
+                    TRY_CONVERT(DECIMAL(12,2), CASE WHEN n.es_neg=1 THEN '-' + n.cand_punto ELSE n.cand_punto END),
+                    TRY_CONVERT(DECIMAL(12,2), CASE WHEN n.es_neg=1 THEN '-' + n.cand_coma  ELSE n.cand_coma  END),
+                    /* último recurso: entero */
+                    TRY_CONVERT(DECIMAL(12,2), CASE WHEN n.es_neg=1 THEN '-' + n.cand_sin   ELSE n.cand_sin   END)
+                ) AS valor
+            FROM decpos n
+        )
+        INSERT INTO #pagos (id_norm, fecha, CBU_CVU, valor)
+        SELECT id_norm, fecha, CBU_CVU, valor
+        FROM parsed
+        WHERE fecha IS NOT NULL
+          AND valor IS NOT NULL
+          AND CBU_CVU IS NOT NULL
+          AND CBU_CVU <> REPLICATE('0',22);
+
+        DECLARE @FilasPagos INT = (SELECT COUNT(*) FROM #pagos);
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @DetPagos NVARCHAR(4000) =
+                CONCAT(N'pagos_validos=', CONVERT(NVARCHAR(20), @FilasPagos));
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO',
+                 N'Parseo de pagos', @DetPagos, @RutaArchivo, @LogPath;
+        END
+
+        /* Errores de parseo 1:1 por id_norm (evita que “desaparezcan” filas) */
+        INSERT INTO #errores (motivo, fecha_txt, cbu_txt, valor_txt)
+        SELECT N'Fila inválida (fecha/valor/CBU)', n.fecha_txt, n.cbu_txt, n.valor_txt
+        FROM #norm n
+        LEFT JOIN #pagos p ON p.id_norm = n.id_norm
+        WHERE p.id_norm IS NULL;
+
+        DECLARE @ErroresParseo INT = (SELECT COUNT(*) FROM #errores);
+
+        /* =============================== 4) Enriquecer (UF/Consorcio/Expensa) =============================== */
+        ;WITH pagos_enriq AS
+        (
+            SELECT
+                p.fecha,
+                p.valor                AS monto,
+                p.CBU_CVU,
+                uf.idUnidadFuncional,
+                uf.idConsorcio
+            FROM #pagos p
+            LEFT JOIN app.Tbl_UnidadFuncional uf
+                   ON uf.CBU_CVU = p.CBU_CVU
+        )
+        SELECT
+            pe.*,
+            e.nroExpensa
+        INTO #pagos_completos
+        FROM pagos_enriq pe
+        CROSS APPLY (VALUES (DATEFROMPARTS(YEAR(pe.fecha), MONTH(pe.fecha), 1))) AS m(inicioMes)
+        OUTER APPLY
+        (
+            SELECT TOP (1) e.nroExpensa
+            FROM app.Tbl_Expensa e
+            WHERE e.idConsorcio = pe.idConsorcio
+              AND e.fechaGeneracion >= m.inicioMes
+              AND e.fechaGeneracion <  DATEADD(MONTH, 1, m.inicioMes)
+            ORDER BY e.fechaGeneracion DESC, e.nroExpensa DESC
+        ) e;
+
+        /* Registrar faltantes de mapeo (UF/consorcio/expensa) */
+        INSERT INTO #errores (motivo, fecha_txt, cbu_txt, valor_txt)
+        SELECT
+            CASE 
+              WHEN idUnidadFuncional IS NULL THEN N'No se encontró UF para ese CBU'
+              WHEN idConsorcio IS NULL       THEN N'No se determinó Consorcio'
+              WHEN nroExpensa IS NULL        THEN N'No hay expensa del mes para el consorcio'
+            END,
+            CONVERT(NVARCHAR(30), fecha, 121),
+            CBU_CVU,
+            CONVERT(NVARCHAR(40), monto)
+        FROM #pagos_completos
+        WHERE idUnidadFuncional IS NULL
+           OR idConsorcio IS NULL
+           OR nroExpensa IS NULL;
+
+        /* Registrar filas sin EstadoCuenta */
+        INSERT INTO #errores (motivo, fecha_txt, cbu_txt, valor_txt)
+        SELECT
+            N'No existe EstadoCuenta para UF/Consorcio/Expensa',
+            CONVERT(NVARCHAR(30), p.fecha, 121),
+            p.CBU_CVU,
+            CONVERT(NVARCHAR(40), p.monto)
+        FROM #pagos_completos p
+        WHERE p.idUnidadFuncional IS NOT NULL
+          AND p.idConsorcio IS NOT NULL
+          AND p.nroExpensa IS NOT NULL
+          AND NOT EXISTS (
+                SELECT 1
+                FROM app.Tbl_EstadoCuenta ec
+                WHERE ec.nroUnidadFuncional = p.idUnidadFuncional
+                  AND ec.idConsorcio       = p.idConsorcio
+                  AND ec.nroExpensa        = p.nroExpensa
+          );
+
+        /* Filas válidas (con mapeo completo Y EstadoCuenta existente) */
+        IF OBJECT_ID('tempdb..#ok') IS NOT NULL DROP TABLE #ok;
+
+        SELECT DISTINCT
+            p.fecha,
+            p.monto,
+            p.CBU_CVU,
+            p.idUnidadFuncional,
+            p.idConsorcio,
+            p.nroExpensa,
+            ec.idEstadoCuenta
+        INTO #ok
+        FROM #pagos_completos p
+        JOIN app.Tbl_EstadoCuenta ec
+          ON ec.nroUnidadFuncional = p.idUnidadFuncional
+         AND ec.idConsorcio       = p.idConsorcio
+         AND ec.nroExpensa        = p.nroExpensa
+        WHERE p.idUnidadFuncional IS NOT NULL
+          AND p.idConsorcio IS NOT NULL
+          AND p.nroExpensa IS NOT NULL;
+
+        DECLARE @ErroresMatch       INT = (SELECT COUNT(*) FROM #errores) - @ErroresParseo;
+        DECLARE @FilasOK            INT = (SELECT COUNT(*) FROM #ok);
+        DECLARE @PagosNoAsociados   INT = (SELECT COUNT(*) FROM #errores);
+
+        IF @Verbose = 1
+        BEGIN
+            IF @ErroresMatch > 0
+            BEGIN
+                DECLARE @DetErrMatchMsg NVARCHAR(4000) =
+                    CONCAT(N'falla_match=', CONVERT(NVARCHAR(20), @ErroresMatch));
+                EXEC reportes.Sp_LogReporte @Procedimiento, 'WARN',
+                     N'Filas sin mapping completo', @DetErrMatchMsg, @RutaArchivo, @LogPath;
+            END;
+
+            DECLARE @DetOkMsg NVARCHAR(4000) =
+                CONCAT(N'pagos_ok=', CONVERT(NVARCHAR(20), @FilasOK));
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO',
+                 N'Filas listas para inserción', @DetOkMsg, @RutaArchivo, @LogPath;
+        END
+
+        /* =============================== 4.b) Pagos no asociados (idempotente) =============================== */
+        IF OBJECT_ID('importacion.Tbl_Pago_No_Asociado', 'U') IS NOT NULL
+        BEGIN
+            INSERT INTO importacion.Tbl_Pago_No_Asociado
+                (motivo, fecha_txt, cbu_txt, valor_txt, rutaArchivo)
+            SELECT e.motivo, e.fecha_txt, e.cbu_txt, e.valor_txt, @RutaArchivo
+            FROM #errores e
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM importacion.Tbl_Pago_No_Asociado x
+                WHERE x.motivo      = e.motivo
+                  AND x.fecha_txt   = e.fecha_txt
+                  AND x.cbu_txt     = e.cbu_txt
+                  AND x.valor_txt   = e.valor_txt
+                  AND x.rutaArchivo = @RutaArchivo
+            );
+
+            IF @Verbose = 1
+            BEGIN
+                DECLARE @DetNoAsocMsg NVARCHAR(4000) =
+                    CONCAT(N'pagos_no_asociados=', CONVERT(NVARCHAR(20), @PagosNoAsociados));
+                EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO',
+                     N'Pagos no asociados registrados', @DetNoAsocMsg, @RutaArchivo, @LogPath;
+            END
+        END
+
+        /* =============================== 5) INSERTAR PAGOS (IDEMPOTENTE) =============================== */
+        IF OBJECT_ID('tempdb..#merge_out_pagos') IS NOT NULL DROP TABLE #merge_out_pagos;
+        CREATE TABLE #merge_out_pagos (accion NVARCHAR(10));
+
+        ;WITH src AS (
+            SELECT
+                o.idEstadoCuenta,
+                o.idUnidadFuncional AS nroUnidadFuncional,
+                o.idConsorcio,
+                o.nroExpensa,
+                o.fecha,
+                o.monto,
+                o.CBU_CVU
+            FROM #ok o
+        )
+        MERGE app.Tbl_Pago AS T
+        USING src AS S
+           ON  T.idEstadoCuenta     = S.idEstadoCuenta
+           AND T.nroUnidadFuncional = S.nroUnidadFuncional
+           AND T.idConsorcio        = S.idConsorcio
+           AND T.nroExpensa         = S.nroExpensa
+           AND T.fecha              = S.fecha
+           AND T.monto              = S.monto
+           AND T.CBU_CVU            = S.CBU_CVU
+        WHEN NOT MATCHED THEN
+            INSERT (idEstadoCuenta, nroUnidadFuncional, idConsorcio, nroExpensa,
+                    fecha, monto, CBU_CVU)
+            VALUES (S.idEstadoCuenta, S.nroUnidadFuncional, S.idConsorcio, S.nroExpensa,
+                    S.fecha, S.monto, S.CBU_CVU)
+        OUTPUT $action INTO #merge_out_pagos;
+
+        DECLARE @PagosInsertados INT =
+            (SELECT COUNT(*) FROM #merge_out_pagos WHERE accion = 'INSERT');
+
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @DetInsMsg NVARCHAR(4000) =
+                CONCAT(N'pagos_insertados=', CONVERT(NVARCHAR(20), @PagosInsertados));
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO',
+                 N'Pagos insertados (idempotente)', @DetInsMsg, @RutaArchivo, @LogPath;
+        END
+
+        /* =============================== 6) Resumen =============================== */
+        DECLARE @Resumen NVARCHAR(4000);
+        SET @Resumen =
+            CONCAT(
+                N'raw=', @FilasRaw,
+                N'; norm=', @FilasNorm,
+                N'; pagos_validos=', @FilasPagos,
+                N'; errores_parseo=', @ErroresParseo,
+                N'; errores_match=', @ErroresMatch,
+                N'; pagos_no_asociados=', @PagosNoAsociados,
+                N'; pagos_listos=', @FilasOK,
+                N'; pagos_ins_total(tras merge)=', @PagosInsertados
             );
 
         IF @Verbose = 1
@@ -1851,6 +2141,8 @@ BEGIN
     END CATCH
 END
 GO
+
+
 -- //////////////////////////////////////////////////////////////////////
 CREATE OR ALTER PROCEDURE app.Sp_CargarGastosExtraordinariosIniciales
     @Verbose BIT = 0

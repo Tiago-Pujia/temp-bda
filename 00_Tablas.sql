@@ -10,6 +10,15 @@ rol -> [rol_nombreRol] -> ejemplo: rol_Admin
 usuarios -> [usr_nombreUsuario] -> ejemplo: usr_app
 */
 
+/**
+PARA BORRAR LA BASE DE DATOS:
+USE master;
+GO
+ALTER DATABASE Com5600G13 SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+DROP DATABASE Com5600G13;
+GO
+**/
+
 USE MASTER
 GO
 
@@ -104,14 +113,11 @@ CREATE TABLE app.Tbl_UFPersona (
     idPersona INT NOT NULL,
     idConsorcio INT NOT NULL,
     esInquilino BIT,
-    fechaInicio DATE,
-    fechaFin DATE,
     CONSTRAINT PK_UFPersona PRIMARY KEY (idPersona),
     CONSTRAINT FK_UFPersona_Persona
         FOREIGN KEY (idPersona) REFERENCES app.Tbl_Persona (idPersona),
     CONSTRAINT FK_UFPersona_Consorcio
         FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio (idConsorcio),
-    CONSTRAINT CHK_UFPersona_Fechas CHECK (fechaFin IS NULL OR fechaFin >= fechaInicio)
 );
 GO
 
