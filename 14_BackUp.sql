@@ -1,9 +1,20 @@
 /* ============================================================
    BACKUPS Com5600G13 - SOLUCION PARA SQL EXPRESS
    - SIN COMPRESSION (no soportado en Express)
-   - Crea carpetas automáticamente si no existen
+   - Crea carpetas automï¿½ticamente si no existen
    - Manejo de errores completo
    ============================================================ */
+
+/*
+Archivo: 14_BackUp.sql
+PropÃ³sito: Rutinas y recomendaciones para respaldos y restauraciones parciales.
+
+Advertencias:
+ - Algunos scripts usan xp_cmdshell o rutas absolute para copiar archivos; esto
+     requiere permisos OS y puede ser peligroso si se ejecuta con credenciales
+     elevadas.
+ - ProbÃ¡ restauraciones en un ambiente aislado antes de aplicarlas en producciÃ³n.
+*/
 
 USE master;
 GO
@@ -21,7 +32,7 @@ IF OBJECT_ID(N'maintenance.usp_CreateBackupFolder', N'P') IS NOT NULL DROP PROCE
 IF OBJECT_ID(N'maintenance.fn_Timestamp_yyyymmdd_hhmm', N'FN') IS NOT NULL DROP FUNCTION maintenance.fn_Timestamp_yyyymmdd_hhmm;
 GO
 
-/* 2) Función timestamp */
+/* 2) Funciï¿½n timestamp */
 CREATE FUNCTION maintenance.fn_Timestamp_yyyymmdd_hhmm()
 RETURNS NVARCHAR(15)
 AS
@@ -41,7 +52,7 @@ BEGIN
     DECLARE @cmd NVARCHAR(500);
     DECLARE @xpcmdEnabled INT;
     
-    -- Verificar si xp_cmdshell está habilitado
+    -- Verificar si xp_cmdshell estï¿½ habilitado
     SELECT @xpcmdEnabled = CAST(value_in_use AS INT)
     FROM sys.configurations 
     WHERE name = 'xp_cmdshell';
@@ -68,7 +79,7 @@ BEGIN
     SET NOCOUNT ON;
     
     BEGIN TRY
-        -- Verificar que la base existe y está online
+        -- Verificar que la base existe y estï¿½ online
         IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = N'Com5600G13' AND state = 0)
         BEGIN
             RAISERROR(N'Base de datos Com5600G13 no disponible', 16, 1);
@@ -86,10 +97,10 @@ BEGIN
           TO DISK = @file
           WITH INIT, CHECKSUM, STATS = 10;
         
-        -- Verificación
+        -- Verificaciï¿½n
         RESTORE VERIFYONLY FROM DISK = @file WITH CHECKSUM;
         
-        -- Log de éxito
+        -- Log de ï¿½xito
         PRINT '? BACKUP FULL completado: ' + @file;
         
         IF OBJECT_ID(N'reportes.Sp_LogReporte', N'P') IS NOT NULL
@@ -189,10 +200,10 @@ BEGIN
     SET NOCOUNT ON;
     
     BEGIN TRY
-        -- Verificar modelo de recuperación FULL
+        -- Verificar modelo de recuperaciï¿½n FULL
         IF (SELECT recovery_model_desc FROM sys.databases WHERE name = N'Com5600G13') <> 'FULL'
         BEGIN
-            PRINT '??  Base no está en FULL recovery. BACKUP LOG omitido.';
+            PRINT '??  Base no estï¿½ en FULL recovery. BACKUP LOG omitido.';
             RETURN;
         END
         
@@ -265,7 +276,7 @@ GO
 
 /* ======================================================
    PASO 1: HABILITAR xp_cmdshell TEMPORALMENTE
-   (Para crear carpetas automáticamente)
+   (Para crear carpetas automï¿½ticamente)
    ====================================================== */
 PRINT '';
 PRINT '========================================';
@@ -293,13 +304,13 @@ PRINT '========================================';
 PRINT 'EJECUTANDO BACKUPS...';
 PRINT '========================================';
 
--- FULL (crea carpeta automáticamente)
+-- FULL (crea carpeta automï¿½ticamente)
 EXEC maintenance.usp_Backup_Com5600G13_Full @FullDir=@FullDir, @LogFile=@LogFile;
 
 -- DIFF (requiere FULL previo)
 EXEC maintenance.usp_Backup_Com5600G13_Diff @DiffDir=@DiffDir, @LogFile=@LogFile;
 
--- LOG (solo si está en FULL recovery)
+-- LOG (solo si estï¿½ en FULL recovery)
 EXEC maintenance.usp_Backup_Com5600G13_Log @LogDir=@LogDir, @LogFile=@LogFile;
 GO
 
@@ -320,11 +331,11 @@ PRINT '? xp_cmdshell deshabilitado (seguridad)';
 GO
 
 /* ======================================================
-   VERIFICACIÓN FINAL
+   VERIFICACIï¿½N FINAL
    ====================================================== */
 PRINT '';
 PRINT '========================================';
-PRINT 'VERIFICACIÓN EN MSDB';
+PRINT 'VERIFICACIï¿½N EN MSDB';
 PRINT '========================================';
 
 SELECT 
@@ -336,7 +347,7 @@ SELECT
     END AS Tipo,
     b.backup_start_date AS Inicio,
     b.backup_finish_date AS Fin,
-    CAST(b.backup_size / 1024.0 / 1024.0 AS DECIMAL(10,2)) AS TamañoMB,
+    CAST(b.backup_size / 1024.0 / 1024.0 AS DECIMAL(10,2)) AS Tamaï¿½oMB,
     b.has_backup_checksums AS ConChecksum,
     mf.physical_device_name AS Archivo
 FROM msdb.dbo.backupset b
@@ -347,13 +358,13 @@ ORDER BY b.backup_finish_date DESC;
 
 PRINT '';
 PRINT '========================================';
-PRINT '¡BACKUPS COMPLETADOS!';
+PRINT 'ï¿½BACKUPS COMPLETADOS!';
 PRINT '========================================';
 
 /* ============================================================
    TEST COMPLETO DE BACKUPS - Com5600G13
    - Verifica integridad de los archivos
-   - Prueba restauración en base temporal
+   - Prueba restauraciï¿½n en base temporal
    - Valida que los datos son correctos
    ============================================================
 
@@ -371,7 +382,7 @@ PRINT '';
 PRINT '1??  VERIFICANDO ARCHIVOS DE BACKUP...';
 PRINT '----------------------------------------';
 
--- Ver últimos backups realizados
+-- Ver ï¿½ltimos backups realizados
 SELECT 
     b.database_name AS BD,
     CASE b.type 
@@ -381,7 +392,7 @@ SELECT
     END AS Tipo,
     b.backup_start_date AS Inicio,
     b.backup_finish_date AS Fin,
-    CAST(b.backup_size / 1024.0 / 1024.0 AS DECIMAL(10,2)) AS TamañoMB,
+    CAST(b.backup_size / 1024.0 / 1024.0 AS DECIMAL(10,2)) AS Tamaï¿½oMB,
     CASE WHEN b.has_backup_checksums = 1 THEN '?' ELSE '?' END AS Checksum,
     mf.physical_device_name AS Archivo
 FROM msdb.dbo.backupset b
@@ -402,7 +413,7 @@ DECLARE @LastFullPath NVARCHAR(500);
 DECLARE @LastDiffPath NVARCHAR(500);
 DECLARE @LastLogPath NVARCHAR(500);
 
--- Obtener ruta del último FULL
+-- Obtener ruta del ï¿½ltimo FULL
 SELECT TOP 1 @LastFullPath = mf.physical_device_name
 FROM msdb.dbo.backupset b
 JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
@@ -411,7 +422,7 @@ WHERE b.database_name = N'Com5600G13'
   AND b.backup_finish_date IS NOT NULL
 ORDER BY b.backup_finish_date DESC;
 
--- Obtener ruta del último DIFF
+-- Obtener ruta del ï¿½ltimo DIFF
 SELECT TOP 1 @LastDiffPath = mf.physical_device_name
 FROM msdb.dbo.backupset b
 JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
@@ -420,7 +431,7 @@ WHERE b.database_name = N'Com5600G13'
   AND b.backup_finish_date IS NOT NULL
 ORDER BY b.backup_finish_date DESC;
 
--- Obtener ruta del último LOG
+-- Obtener ruta del ï¿½ltimo LOG
 SELECT TOP 1 @LastLogPath = mf.physical_device_name
 FROM msdb.dbo.backupset b
 JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
@@ -479,7 +490,7 @@ PRINT '';
 /* ======================================================
    PARTE 3: VER CONTENIDO DEL BACKUP (sin restaurar)
    ====================================================== */
-PRINT '3??  INFORMACIÓN DEL BACKUP FULL...';
+PRINT '3??  INFORMACIï¿½N DEL BACKUP FULL...';
 PRINT '----------------------------------------';
 
 IF @LastFullPath IS NOT NULL
@@ -489,7 +500,7 @@ BEGIN
     
     PRINT '';
     PRINT 'Archivos dentro del backup:';
-    -- Ver archivos lógicos
+    -- Ver archivos lï¿½gicos
     RESTORE FILELISTONLY FROM DISK = @LastFullPath;
 END
 ELSE
@@ -498,10 +509,10 @@ ELSE
 PRINT '';
 
 /* ======================================================
-   PARTE 4: TEST DE RESTAURACIÓN REAL
+   PARTE 4: TEST DE RESTAURACIï¿½N REAL
    (Crea base temporal para probar)
    ====================================================== */
-PRINT '4??  TEST DE RESTAURACIÓN COMPLETA...';
+PRINT '4??  TEST DE RESTAURACIï¿½N COMPLETA...';
 PRINT '----------------------------------------';
 
 IF @LastFullPath IS NULL
@@ -514,7 +525,7 @@ DECLARE @TestDB NVARCHAR(128) = N'Com5600G13_TEST_RESTORE';
 DECLARE @DataFile NVARCHAR(500);
 DECLARE @LogFile NVARCHAR(500);
 
--- Obtener rutas de archivos físicos del servidor
+-- Obtener rutas de archivos fï¿½sicos del servidor
 DECLARE @DefaultDataPath NVARCHAR(500);
 DECLARE @DefaultLogPath NVARCHAR(500);
 
@@ -583,7 +594,7 @@ BEGIN TRY
     EXEC sp_executesql @SqlCount;
     
     PRINT '';
-    PRINT '  ? RESTAURACIÓN EXITOSA - Los backups están BIEN';
+    PRINT '  ? RESTAURACIï¿½N EXITOSA - Los backups estï¿½n BIEN';
     
     -- Limpiar base de prueba
     PRINT '';
@@ -594,9 +605,9 @@ BEGIN TRY
     
 END TRY
 BEGIN CATCH
-    PRINT '  ? ERROR en restauración: ' + ERROR_MESSAGE();
+    PRINT '  ? ERROR en restauraciï¿½n: ' + ERROR_MESSAGE();
     
-    -- Intentar limpiar si quedó algo
+    -- Intentar limpiar si quedï¿½ algo
     IF EXISTS (SELECT 1 FROM sys.databases WHERE name = @TestDB)
     BEGIN
         EXEC('USE master; ALTER DATABASE [' + @TestDB + '] SET SINGLE_USER WITH ROLLBACK IMMEDIATE');
@@ -639,22 +650,22 @@ WHERE database_name = N'Com5600G13'
 PRINT 'Total backups FULL: ' + CAST(@FullCount AS VARCHAR);
 PRINT 'Total backups DIFF: ' + CAST(@DiffCount AS VARCHAR);
 PRINT 'Total backups LOG:  ' + CAST(@LogCount AS VARCHAR);
-PRINT 'Backups últimas 24h: ' + CAST(@Last24h AS VARCHAR);
+PRINT 'Backups ï¿½ltimas 24h: ' + CAST(@Last24h AS VARCHAR);
 PRINT '';
 
 IF @FullCount = 0
     PRINT '??  NO HAY BACKUPS FULL - Ejecutar urgente!';
 ELSE IF @Last24h = 0
-    PRINT '??  NO HAY BACKUPS RECIENTES - Verificar programación';
+    PRINT '??  NO HAY BACKUPS RECIENTES - Verificar programaciï¿½n';
 ELSE
-    PRINT '? HAY BACKUPS VÁLIDOS Y VERIFICADOS';
+    PRINT '? HAY BACKUPS Vï¿½LIDOS Y VERIFICADOS';
 
 PRINT '';
 PRINT '========================================';
-PRINT '?? PRÓXIMOS PASOS';
+PRINT '?? PRï¿½XIMOS PASOS';
 PRINT '========================================';
 PRINT '1. Si todo OK: Programar en SQL Agent o Programador de Tareas';
 PRINT '2. Verificar espacio en disco regularmente';
-PRINT '3. Probar restauración completa al menos 1 vez al mes';
-PRINT '4. Copiar backups a ubicación externa (NAS, nube, otro servidor)';
+PRINT '3. Probar restauraciï¿½n completa al menos 1 vez al mes';
+PRINT '4. Copiar backups a ubicaciï¿½n externa (NAS, nube, otro servidor)';
 PRINT ''; **/

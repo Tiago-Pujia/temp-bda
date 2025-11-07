@@ -1,8 +1,11 @@
--- ============================================================
--- SCRIPT DE CARGA MASIVA DE DATOS PARA EL SISTEMA DE CONSORCIOS
--- Este script ejecuta todos los procedimientos de importación
--- para cargar datos iniciales desde diferentes formatos de archivo
--- ============================================================
+/*
+Archivo: 05_LotePruebasArchivos.sql
+Propósito: Script de orquestación que ejecuta los procedimientos de importación
+para cargar datos iniciales desde archivos (Excel, CSV, JSON, TXT).
+
+Uso: Pensado para entornos de desarrollo o pruebas. Ajustá rutas de archivos antes
+de ejecutarlo en otro equipo (variables @RutaArchivo dentro de los EXEC).
+*/
 
 USE Com5600G13;
 GO

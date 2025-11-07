@@ -19,6 +19,19 @@ DROP DATABASE Com5600G13;
 GO
 **/
 
+/*
+Archivo: 00_Tablas.sql
+Propósito: Crea la base de datos Com5600G13 (si no existe), los esquemas y las
+tablas principales que usa la aplicación. Contiene constraints básicos y claves
+foráneas necesarias para la integridad referencial.
+
+Notas de uso:
+ - Ejecutar solo en despliegues controlados o en entornos de desarrollo.
+ - Hacer respaldo antes de volver a crear o modificar tablas existentes.
+ - No mezclar cambios lógicos con esta pasada de comentarios; este archivo
+     inicializa la estructura principal.
+*/
+
 USE MASTER
 GO
 
@@ -48,19 +61,20 @@ IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'seguridad')
     EXEC ('CREATE SCHEMA seguridad');
 GO
 
+IF OBJECT_ID(N'app.Tbl_ExpensaEnvio', N'U') IS NOT NULL DROP TABLE app.Tbl_ExpensaEnvio;
 IF OBJECT_ID(N'app.Tbl_Pago', N'U') IS NOT NULL DROP TABLE app.Tbl_Pago;
 IF OBJECT_ID(N'app.Tbl_EstadoCuenta', N'U') IS NOT NULL DROP TABLE app.Tbl_EstadoCuenta;
 IF OBJECT_ID(N'app.Tbl_Gasto_Extraordinario', N'U') IS NOT NULL DROP TABLE app.Tbl_Gasto_Extraordinario;
 IF OBJECT_ID(N'app.Tbl_Gasto_Ordinario', N'U') IS NOT NULL DROP TABLE app.Tbl_Gasto_Ordinario;
 IF OBJECT_ID(N'app.Tbl_Gasto', N'U') IS NOT NULL DROP TABLE app.Tbl_Gasto;
-IF OBJECT_ID(N'app.Tbl_Expensa', N'U') IS NOT NULL DROP TABLE app.Tbl_Expensa;
 IF OBJECT_ID(N'app.Tbl_UFPersona', N'U') IS NOT NULL DROP TABLE app.Tbl_UFPersona;
 IF OBJECT_ID(N'app.Tbl_UnidadFuncional', N'U') IS NOT NULL DROP TABLE app.Tbl_UnidadFuncional;
-IF OBJECT_ID(N'app.Tbl_Consorcio', N'U') IS NOT NULL DROP TABLE app.Tbl_Consorcio;
+IF OBJECT_ID(N'app.Tbl_Expensa', N'U') IS NOT NULL DROP TABLE app.Tbl_Expensa;
 IF OBJECT_ID(N'app.Tbl_Persona', N'U') IS NOT NULL DROP TABLE app.Tbl_Persona;
+IF OBJECT_ID(N'app.Tbl_Consorcio', N'U') IS NOT NULL DROP TABLE app.Tbl_Consorcio;
+IF OBJECT_ID(N'app.Tbl_Feriado', N'U') IS NOT NULL DROP TABLE app.Tbl_Feriado;
 IF OBJECT_ID(N'api.Tbl_CotizacionDolar', N'U') IS NOT NULL DROP TABLE api.Tbl_CotizacionDolar;
 IF OBJECT_ID(N'reportes.logsReportes', N'U') IS NOT NULL DROP TABLE reportes.logsReportes;
-IF OBJECT_ID(N'app.Tbl_Feriado', N'U') IS NOT NULL DROP TABLE app.Tbl_Feriado;
 GO
 
 /* ---- Tbl_Persona ---- */
@@ -117,7 +131,7 @@ CREATE TABLE app.Tbl_UFPersona (
     CONSTRAINT FK_UFPersona_Persona
         FOREIGN KEY (idPersona) REFERENCES app.Tbl_Persona (idPersona),
     CONSTRAINT FK_UFPersona_Consorcio
-        FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio (idConsorcio),
+        FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio (idConsorcio)
 );
 GO
 
@@ -253,3 +267,21 @@ GO
 CREATE TABLE app.Tbl_Feriado (
     fecha DATE NOT NULL PRIMARY KEY
 );
+GO
+
+CREATE TABLE app.Tbl_ExpensaEnvio (
+        idEnvio        INT IDENTITY(1,1) PRIMARY KEY,
+        idConsorcio    INT NOT NULL,
+        nroExpensa     INT NOT NULL,
+        idPersona      INT NOT NULL,
+        medio          VARCHAR(10) NOT NULL CHECK (medio IN ('EMAIL','WHATSAPP','IMPRESO')),
+        email          VARCHAR(100) NULL,
+        telefono       VARCHAR(20) NULL,
+        fechaRegistro  DATETIME2(3) NOT NULL CONSTRAINT DF_Tbl_ExpensaEnvio_fecha DEFAULT SYSUTCDATETIME(),
+        observacion    NVARCHAR(200) NULL,
+        CONSTRAINT UQ_ExpensaEnvio UNIQUE (idConsorcio, nroExpensa, idPersona),
+        CONSTRAINT FK_ExpensaEnvio_Consorcio FOREIGN KEY (idConsorcio) REFERENCES app.Tbl_Consorcio(idConsorcio),
+        CONSTRAINT FK_ExpensaEnvio_Expensa   FOREIGN KEY (nroExpensa) REFERENCES app.Tbl_Expensa(nroExpensa),
+        CONSTRAINT FK_ExpensaEnvio_Persona   FOREIGN KEY (idPersona)   REFERENCES app.Tbl_Persona(idPersona)
+    );
+GO

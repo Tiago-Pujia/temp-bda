@@ -1,4 +1,16 @@
-﻿USE Com5600G13;
+﻿/*
+Archivo: 12_TestingLotePruebas.sql
+Propósito: Scripts para probar las rutinas de importación y procesamiento en
+ambiente local. Incluye inserciones de datos de muestra y validaciones rápidas.
+
+Notas prácticas:
+ - Estos scripts modifican datos en la base; ejecutalos solo en entornos de
+   testing o con respaldo reciente.
+ - Los datos de ejemplo están pensados para cubrir casos comunes y errores
+   de formato (importes con coma/punto, mails mal formados, fechas faltantes).
+*/
+
+USE Com5600G13;
 GO
 
 /* =========================================================

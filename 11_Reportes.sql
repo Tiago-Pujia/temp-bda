@@ -1,6 +1,30 @@
+/*
+Archivo: 11_Reportes.sql
+Propósito: Consultas y procedimientos para generar informes financieros y de
+recaudación (flujo de caja, top meses, propidades morosas, etc.).
+
+Uso y recomendaciones:
+ - Los procedimientos están optimizados para consulta; ejecutalos desde usuarios con
+     permisos de solo lectura cuando sea posible.
+ - Si necesitás exportar a Excel/PDF, consumí estas vistas/procedimientos desde la
+     capa de reporte (no modifiques las tablas desde aquí).
+*/
+
 USE Com5600G13;
 GO
 
+/*
+reportes.Sp_FlujoCajaSemanal
+Propósito: calcular la recaudación semanal prorrateada entre ordinarias y
+extraordinarias para un rango de fechas y (opcionalmente) un consorcio.
+
+Contrato:
+ - @FechaInicio/@FechaFin: rango (por defecto últimos 3 meses)
+ - @IdConsorcio: filtro opcional
+
+Notas:
+ - Devuelve filas por semana con acumulados y promedio.
+*/
 CREATE OR ALTER PROCEDURE reportes.Sp_FlujoCajaSemanal
     @FechaInicio DATE = NULL,
     @FechaFin    DATE = NULL,
@@ -87,6 +111,14 @@ BEGIN
 END
 GO
 
+/*
+reportes.Sp_RecaudacionMesDepartamento
+Propósito: generar recaudación mensual por departamento (piso+departamento)
+para un año y consorcio especificados.
+
+Opciones:
+ - @FormatoXML = 1 devuelve XML listo para exportar.
+*/
 CREATE OR ALTER PROCEDURE reportes.Sp_RecaudacionMesDepartamento
     @Anio        INT = NULL,
     @IdConsorcio INT = NULL,
@@ -140,6 +172,14 @@ BEGIN
 END
 GO
 
+/*
+reportes.Sp_RecaudacionPorProcedencia
+Propósito: desagregar la recaudación por origen (ordinario/extraordinario)
+agrupada por mes o trimestre.
+
+Contrato:
+ - @FechaInicio/@FechaFin: rango; @Agrupacion: 'MES' o 'TRIMESTRE'
+*/
 CREATE OR ALTER PROCEDURE reportes.Sp_RecaudacionPorProcedencia
     @FechaInicio DATE = NULL,
     @FechaFin    DATE = NULL,
@@ -228,6 +268,15 @@ BEGIN
 END
 GO
 
+/*
+reportes.Sp_Top5MesesGastosIngresos
+Propósito: obtener los top 5 meses por gastos y por ingresos, opcionalmente
+mostrando valores en dólares según la cotización disponible.
+
+Notas:
+ - Si `@RefrescarCotizacion` = 1 intenta obtener la cotización antes del cálculo
+     (no fatal si la API falla).
+*/
 CREATE OR ALTER PROCEDURE reportes.Sp_Top5MesesGastosIngresos
     @Anio                 INT = NULL,
     @IdConsorcio          INT = NULL,
@@ -243,7 +292,7 @@ BEGIN
     -- **FIX 1: Declarar @cot AL INICIO**
     DECLARE @cot DECIMAL(10,2) = NULL;
 
-    /* (Opcional) refrescar cotizaci�n UNA SOLA VEZ */
+    /* (Opcional) refrescar cotizaci�n UNA SOLA VEZ */
     IF @RefrescarCotizacion = 1
     BEGIN
         BEGIN TRY
@@ -255,16 +304,16 @@ BEGIN
         END CATCH
     END
 
-    /* **FIX 2: Obtener la �ltima cotizaci�n con manejo robusto** */
+    /* **FIX 2: Obtener la �ltima cotizaci�n con manejo robusto** */
     SELECT TOP(1) @cot = valorVenta
     FROM api.Tbl_CotizacionDolar WITH (NOLOCK)
     WHERE tipoDolar = @TipoDolar
     ORDER BY fechaConsulta DESC;
 
-    -- **FIX 3: Log de debug (opcional, quitar en producci�n)**
+    -- **FIX 3: Log de debug (opcional, quitar en producci�n)**
     IF @cot IS NULL OR @cot <= 0 
     BEGIN
-        -- Insertar warning en logs si est� disponible
+        -- Insertar warning en logs si est� disponible
         IF OBJECT_ID('reportes.Sp_LogReporte','P') IS NOT NULL
         BEGIN
             DECLARE @detalle NVARCHAR(4000) = 
@@ -274,7 +323,7 @@ BEGIN
             EXEC reportes.Sp_LogReporte 
                 @Procedimiento = N'reportes.Sp_Top5MesesGastosIngresos',
                 @Tipo = 'WARN',
-                @Mensaje = N'No se encontr� cotizaci�n v�lida',
+                @Mensaje = N'No se encontr� cotizaci�n v�lida',
                 @Detalle = @detalle;
         END
         
@@ -334,6 +383,17 @@ BEGIN
 END
 GO
 
+/*
+reportes.Sp_PropietariosMorosos
+Propósito: listar propietarios morosos ordenados por deuda total, con filtros de
+fecha y consorcio.
+
+Notas:
+ - Usa `seguridad.fn_DesencriptarTexto` como fallback para emparejar CBU si las
+     columnas en texto están desencriptadas.
+ - Evita exponer datos sensibles sin permisos; este SP debería usarse desde
+     una capa que aplique control de acceso.
+*/
 CREATE OR ALTER PROCEDURE reportes.Sp_PropietariosMorosos
     @IdConsorcio INT  = NULL,
     @FechaCorte  DATE = NULL,

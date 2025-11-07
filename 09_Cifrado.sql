@@ -1,3 +1,14 @@
+/*
+Archivo: 09_Cifrado.sql
+Propósito: Añade columnas cifradas para datos sensibles y encripta los valores
+existentes. Incluye vistas y helpers para exponer datos desencriptados de forma
+controlada.
+
+Advertencias:
+ - El cifrado usado depende de funciones definidas en `seguridad` (pasphrase interna).
+ - Revisá políticas de claves y almacenamiento seguro antes de usar en producción.
+*/
+
 -- Este script agrega columnas cifradas para datos personales sensibles
 -- y encripta los datos existentes en las tablas
 

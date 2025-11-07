@@ -1,3 +1,25 @@
+/*
+Archivo: 01_Indices.sql
+Propósito: Crea índices pensados para consultas frecuentes (pagos, expensas, estados de
+cuenta y búsqueda por CBU/CBU). Estos índices ayudan en performance de reportes y joins.
+
+Notas:
+ - Revisá los índices INCLUDE según el tamaño real de las filas; mantener demasiados
+         includes puede aumentar IO en escrituras.
+ - Algunos índices son UNIQUE para proteger integridad (ej: CBU/CBU). Si cambiás
+         longitud/colaciones revisá estas restricciones.
+
+Consejos prácticos (tono humano):
+ - Antes de agregar un índice nuevo, mirá primero los planes de consulta y el
+     patrón de filtros (WHERE) y joins. Un índice que no se usa solo agrega costo
+     en escrituras.
+ - Los INCLUDE son útiles para evitar lookups cuando las consultas piden columnas
+     adicionales; no incluyas columnas grandes si las consultas rara vez las piden.
+ - Si una consulta filtra por rango de fechas, ordena las columnas del índice
+     poniendo la parte de igualdad primero y el rango después (p.ej. idConsorcio,
+     fechaGeneracion).
+*/
+
 USE Com5600G13;
 GO
 

@@ -1,3 +1,16 @@
+/*
+Archivo: 03_Funciones.sql
+Propósito: Helpers y funciones utilitarias usadas por los procesos de importación,
+normalización y conversión de datos (texto, montos, emails, fechas hábiles, etc.).
+
+Consejos breves:
+ - Estas funciones están diseñadas para limpiar y normalizar datos entrantes antes de
+     insertarlos en tablas tipadas (staging). Usalas en los pipelines de importación.
+ - `fn_ParseImporteFlexible` y `fn_A_Decimal` son tolerantes a formatos locales
+     (coma/punto) y caracteres no numéricos.
+ - Revisá `seguridad.fn_EncriptarTexto` si hay duplicados o versiones inconsistentes.
+*/
+
 USE Com5600G13;
 GO
 
@@ -279,20 +292,35 @@ BEGIN
 END;
 GO
 
-/** Encripta un texto y retorna un alfanumerico **/
-CREATE OR ALTER FUNCTION seguridad.fn_EncriptarTexto(@texto NVARCHAR(4000))
-RETURNS VARBINARY(512)
+/**
+Helper: convierte texto a VARBINARY sin aplicar cifrado fuerte.
+Uso: función utilitaria para casos donde se necesita almacenar el valor en
+formato varbinary por compatibilidad. NO ES CIFRADO, solo conversión de tipo.
+*/
+CREATE OR ALTER FUNCTION seguridad.fn_TextoAvarbinary(@texto NVARCHAR(4000))
+RETURNS VARBINARY(MAX)
 AS
 BEGIN
     RETURN
         CASE 
             WHEN @texto IS NULL THEN NULL
-            ELSE CONVERT(VARBINARY(512), @texto)
+            ELSE CONVERT(VARBINARY(MAX), @texto)
         END;
 END;
 GO
 
-/**Descripta un alfanumerico y retorna un texto  **/
+/**
+Encripta un texto usando ENCRYPTBYPASSPHRASE y devuelve VARBINARY.
+Contrato:
+ - @texto: texto claro a encriptar
+ - Retorno: VARBINARY(MAX) con los bytes encriptados. Requiere que la misma
+   passphrase se use para desencriptar con DECRYPTBYPASSPHRASE.
+Notas:
+ - La clave está embebida en el script (Consorcio-2025-ClaveSecreta). Para
+   producción considerá usar un almacén de claves o Key Vault.
+ - Cambiar la passphrase invalidará datos previamente encriptados si no se
+   mantiene compatibilidad.
+*/
 CREATE OR ALTER FUNCTION seguridad.fn_EncriptarTexto(@texto NVARCHAR(4000))
 RETURNS VARBINARY(MAX)
 AS
@@ -302,7 +330,14 @@ BEGIN
 END;
 GO
 
-/**Descripta un alfanumerico y retorna un texto  **/
+/**
+Desencripta un VARBINARY producido por `seguridad.fn_EncriptarTexto`.
+Contrato:
+ - @dato: VARBINARY encriptado por ENCRYPTBYPASSPHRASE
+ - Retorno: NVARCHAR(4000) con el texto original o NULL si el dato es NULL
+Notas:
+ - Requiere la misma passphrase usada para encriptar.
+*/
 CREATE OR ALTER FUNCTION seguridad.fn_DesencriptarTexto(@dato VARBINARY(MAX))
 RETURNS NVARCHAR(4000)
 AS
@@ -312,40 +347,54 @@ BEGIN
 END;
 GO
 
-CREATE OR ALTER FUNCTION app.fn_EsDiaHabil(@Fecha DATE)
+CREATE OR ALTER FUNCTION app.fn_EsDiaHabil (@fecha DATE)
 RETURNS BIT
 AS
 BEGIN
-    -- 0=Lunes ... 6=Domingo usando ancla 1900-01-01 (lunes)
-    DECLARE @dow INT = (DATEDIFF(DAY, '19000101', @Fecha) % 7 + 7) % 7;
-    IF @dow IN (5,6) RETURN 0; -- Sábado(5) o Domingo(6)
-    IF EXISTS (SELECT 1 FROM app.Tbl_Feriado WHERE fecha = @Fecha) RETURN 0;
+    -- 1900-01-01 fue lunes en SQL Server; %7 = 5/6 son sáb/dom sin depender de DATEFIRST/idioma
+    DECLARE @esFinde BIT =
+        CASE WHEN (DATEDIFF(DAY, '19000101', @fecha) % 7) IN (5,6) THEN 1 ELSE 0 END;
+
+    IF @esFinde = 1 RETURN 0;
+    IF EXISTS (SELECT 1 FROM app.Tbl_Feriado WHERE fecha = @fecha) RETURN 0;
     RETURN 1;
-END;
+END
 GO
 
-CREATE OR ALTER FUNCTION app.fn_SiguienteDiaHabil(@Fecha DATE)
+/* Próximo día hábil (incluyendo la misma fecha si ya es hábil) */
+CREATE OR ALTER FUNCTION app.fn_ProximoDiaHabil (@fecha DATE)
 RETURNS DATE
 AS
 BEGIN
-    DECLARE @d DATE = @Fecha;
-    WHILE app.fn_EsDiaHabil(@d) = 0
+    DECLARE @d DATE = @fecha;
+    WHILE (app.fn_EsDiaHabil(@d) = 0)
         SET @d = DATEADD(DAY, 1, @d);
     RETURN @d;
-END;
+END
 GO
 
-CREATE OR ALTER FUNCTION app.fn_QuintoDiaHabilDelMes(@Referencia DATE)
+/* n-ésimo día hábil del mes */
+CREATE OR ALTER FUNCTION app.fn_NDiaHabil (@anio INT, @mes INT, @n INT)
 RETURNS DATE
 AS
 BEGIN
-    DECLARE @d DATE = DATEFROMPARTS(YEAR(@Referencia), MONTH(@Referencia), 1);
-    DECLARE @c INT = 0;
-    WHILE @c < 5
-    BEGIN
-        IF app.fn_EsDiaHabil(@d) = 1 SET @c += 1;
-        IF @c < 5 SET @d = DATEADD(DAY, 1, @d);
-    END
-    RETURN @d;
-END;
+    DECLARE @primero DATE = DATEFROMPARTS(@anio, @mes, 1);
+    DECLARE @ultimo  DATE = EOMONTH(@primero);
+    DECLARE @res DATE;
+
+    ;WITH d AS (
+        SELECT @primero AS f
+        UNION ALL
+        SELECT DATEADD(DAY, 1, f) FROM d WHERE f < @ultimo
+    ),
+    w AS (
+        SELECT f, ROW_NUMBER() OVER (ORDER BY f) AS rn
+        FROM d
+        WHERE app.fn_EsDiaHabil(f) = 1
+    )
+    SELECT @res = f FROM w WHERE rn = @n
+    OPTION (MAXRECURSION 400);
+
+    RETURN @res;
+END
 GO

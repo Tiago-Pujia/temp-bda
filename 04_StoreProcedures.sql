@@ -1,3 +1,17 @@
+/*
+Archivo: 04_StoreProcedures.sql
+Propósito: Contiene procedimientos almacenados principales para importación de datos,
+procesamiento por lotes y generación de reportes. Incluye SPs que usan OPENROWSET,
+xp_cmdshell y otras funcionalidades que requieren permisos elevados.
+
+Puntos importantes:
+ - Algunos SPs ejecutan comandos en el sistema (xp_cmdshell, curl) y usan proveedores
+     OLEDB para leer archivos. Asegurate de tener permisos y la configuración adecuada
+     antes de ejecutar en un servidor real.
+ - Los SPs están organizados por esquema (`importacion`, `reportes`, `app`, `api`).
+ - Estos procedimientos son idempotentes en su mayoría (evitan duplicados con NOT EXISTS).
+*/
+
 USE master
 GO
 
@@ -13,6 +27,23 @@ USE Com5600G13;
 GO
 
 -- //////////////////////////////////////////////////////////////////////
+/*
+reportes.Sp_LogReporte
+Propósito: registrar eventos operativos del pipeline de importación y procesos
+de reporting. Inserta en la tabla `reportes.logsReportes` y opcionalmente intenta
+escribir una línea en un archivo de log en disco.
+
+Contrato:
+ - Entrada: @Procedimiento (nombre), @Tipo (INFO|WARN|ERROR), @Mensaje, @Detalle,
+     @RutaArchivo (contexto de datos), @RutaLog (archivo físico opcional).
+ - Efecto: inserta una fila en la tabla de logs; si se suministra @RutaLog, intenta
+     escribir una línea en ese archivo mediante xp_cmdshell (echo >> file).
+
+Consideraciones de seguridad/operación:
+ - El intento de escribir en archivo usa xp_cmdshell; si falla se captura y se
+     inserta un registro WARN en la tabla. No provoca rollback del caller.
+ - No uses rutas compartidas inseguras ni dejés credenciales expuestas en @RutaLog.
+*/
 CREATE OR ALTER PROCEDURE reportes.Sp_LogReporte
     @Procedimiento SYSNAME,
     @Tipo          VARCHAR(30),            -- INFO | WARN | ERROR
@@ -71,7 +102,27 @@ CREATE OR ALTER PROCEDURE importacion.Sp_CargarConsorciosDesdeExcel
     @Verbose     BIT = 0                         -- 1 = escribe logs INFO
 AS
 BEGIN
-    SET NOCOUNT ON;
+        /*
+        importacion.Sp_CargarConsorciosDesdeExcel
+        Propósito: leer una hoja de Excel con datos de consorcios y cargarlos en
+        `app.Tbl_Consorcio` evitando duplicados por nombre+dirección.
+
+        Contrato:
+         - @RutaArchivo: ruta absoluta al archivo .xlsx/.xls (obligatorio)
+         - @Hoja: nombre de la hoja (por defecto 'consorcios$')
+         - @HDR: indica si la primera fila es cabecera (1/0)
+         - @LogPath: ruta opcional para escribir un archivo de log
+         - @Verbose: si es 1 escribe logs INFO en `reportes.logsReportes`
+
+        Notas operativas:
+         - Usa `OPENROWSET` con `Microsoft.ACE.OLEDB.16.0`; requiere proveedor instalado
+             y configurado con AllowInProcess.
+         - El proceso realiza una etapa de staging donde normaliza columnas con
+             funciones de `importacion.*` antes de insertar en la tabla final.
+         - Si la tabla destino contiene datos, la inserción evita duplicados por
+             nombre+dirección; modificá el criterio si necesitás otra lógica.
+        */
+        SET NOCOUNT ON;
 
     DECLARE @Procedimiento SYSNAME = N'importacion.Sp_CargarConsorciosDesdeExcel';
 
@@ -199,6 +250,27 @@ CREATE OR ALTER PROCEDURE app.Sp_ActualizarEstadoCuentaDesdeGastos
 AS
 BEGIN
   SET NOCOUNT ON;
+
+    /*
+    app.Sp_ActualizarEstadoCuentaDesdeGastos
+    Propósito: recalcula y materializa en `app.Tbl_EstadoCuenta` los valores derivados
+    de expensas y gastos por unidad funcional. Opera en múltiples pasos:
+     0) Asegura que exista un registro de EstadoCuenta para cada UF×Expensa del filtro
+     1) Normaliza la fecha de estado de cuenta con la fecha de la expensa
+     2) Calcula totales por expensa y prorratea por porcentaje de UF
+     3) Actualiza pagos, intereses y totales según reglas de mora
+
+    Contrato:
+     - Parámetros: filtros por consorcio, nroExpensa y rango de fechas.
+     - Efecto: actualiza/insertar filas en `app.Tbl_EstadoCuenta`.
+
+    Notas de performance y seguridad:
+     - Las operaciones pueden tocar muchas filas; preferible ejecutarlo en ventanas
+         controladas o con mantenimiento fuera de horario pico.
+     - Los triggers asociados a pagos podrían activarse durante estos updates; si
+         necesitás evitar recálculos intermedios, considerá deshabilitar triggers y
+         re-ejecutar el proceso final de sincronización.
+    */
 
   -- Filtrado de expensas materializado (persistente para varias sentencias)
   IF OBJECT_ID('tempdb..#FilExp') IS NOT NULL DROP TABLE #FilExp;
@@ -427,6 +499,23 @@ WHERE (@idConsorcio IS NULL OR e.idConsorcio=@idConsorcio)
 END
 GO
 -- //////////////////////////////////////////////////////////////////////
+/*
+importacion.Sp_CargarGastosDesdeExcel
+Propósito: importar gastos desde una hoja de Excel con columnas esperadas
+ (proveedor, categoría, importe, fecha, etc.) y volcar en tablas de gasto.
+
+Contrato/resumen:
+ - @RutaArchivo: ruta al archivo Excel
+ - @Hoja, @HDR: controlan la hoja y si tiene encabezado
+ - @UsarFechaExpensa: valor por defecto para fechas faltantes
+ - @LogPath, @Verbose: logging opcional
+
+Notas operativas:
+ - Usa `OPENROWSET` y provider ACE.OLEDB; requiere el provider instalado.
+ - Normaliza importes con `importacion.fn_ParseImporteFlexible` y valida
+     filas en staging antes de insert.
+ - Evita duplicados usando criterios internos (proveedor+factura/fecha).
+*/
 CREATE OR ALTER PROCEDURE importacion.Sp_CargarGastosDesdeExcel
     @RutaArchivo       NVARCHAR(4000),            -- ej: C:\...\datos varios.xlsx
     @Hoja              NVARCHAR(128) = N'Proveedores$', -- hoja de Excel
@@ -629,6 +718,22 @@ FROM OPENROWSET(''Microsoft.ACE.OLEDB.16.0'',
 END
 GO
 -- //////////////////////////////////////////////////////////////////////
+/*
+importacion.Sp_CargarGastosDesdeJson
+Propósito: leer un archivo JSON estructurado con gastos por consorcio y año,
+normalizar cada registro y cargarlo en las tablas de gastos.
+
+Contrato/resumen:
+ - @RutaArchivo: archivo .json local
+ - @Anio, @DiaVto1/@DiaVto2: metadatos para construir vencimientos
+ - @LogPath, @Verbose: control de logging
+
+Notas:
+ - El JSON se carga con OPENROWSET(BULK...) y se parsea con OPENJSON; validar
+     estructura antes de ejecutar en producción.
+ - Los importes se normalizan con funciones utilitarias y se aplican checks de
+     integridad antes de insertar.
+*/
 CREATE OR ALTER PROCEDURE importacion.Sp_CargarGastosDesdeJson
     @RutaArchivo NVARCHAR(4000),
     @Anio        INT,
@@ -1004,6 +1109,19 @@ BEGIN
 END
 GO
 -- //////////////////////////////////////////////////////////////////////
+/*
+importacion.Sp_CargarConsorcioYUF_DesdeCsv
+Propósito: importar la relación Consorcio <-> UnidadFuncional desde CSV.
+
+Contrato/resumen:
+ - @RutaArchivo: ruta del CSV
+ - @HDR, @Separador, @CodePage: control de formato
+ - @LogPath, @Verbose: logging opcional
+
+Notas:
+ - Normaliza CBU/CVU y evita duplicados por CBU cuando es posible.
+ - Si las columnas del CSV cambian, ajustar el mapeo dentro del SP.
+*/
 CREATE OR ALTER PROCEDURE importacion.Sp_CargarConsorcioYUF_DesdeCsv
     @RutaArchivo NVARCHAR(4000),            -- C:\...\Inquilino-propietarios-UF.csv
     @HDR         BIT = 1,                   -- 1 = primera fila encabezado
@@ -1243,6 +1361,19 @@ BEGIN
 END
 GO
 -- //////////////////////////////////////////////////////////////////////
+/*
+importacion.Sp_CargarUFsDesdeTxt
+Propósito: importar unidades funcionales desde un archivo TXT con terminador
+de fila configurable.
+
+Contrato/resumen:
+ - @RutaArchivo, @RowTerminator, @CodePage controlan lectura; @HDR indica header
+ - @LogPath, @Verbose: logging
+
+Notas:
+ - Conviene revisar encoding/terminadores si los datos se ven corruptos.
+ - El SP realiza staging y valida porcentajes y formatos antes de insertar.
+*/
 CREATE OR ALTER PROCEDURE importacion.Sp_CargarUFsDesdeTxt
     @RutaArchivo    NVARCHAR(4000),
     @HDR            BIT = 1,
@@ -1439,6 +1570,20 @@ BEGIN
 END
 GO
 -- //////////////////////////////////////////////////////////////////////
+/*
+importacion.Sp_CargarUFInquilinosDesdeCsv
+Propósito: importar personas (propietarios/inquilinos) desde CSV y relacionar
+con unidades funcionales.
+
+Contrato:
+ - @RutaArchivo: CSV con columnas esperadas (nombre, dni, email, idUF o CBU)
+ - @HDR, @RowTerminator, @CodePage: parámetros de formato
+ - @LogPath, @Verbose: logging
+
+Notas:
+ - Normaliza emails/telefonos con helpers y valida DNI para evitar duplicados.
+ - Si no encuentra coincidencia UF por id, intenta emparejar por CBU.
+*/
 CREATE OR ALTER PROCEDURE importacion.Sp_CargarUFInquilinosDesdeCsv
     @RutaArchivo    NVARCHAR(4000),            -- C:\...\Inquilino-propietarios-datos.csv
     @HDR            BIT = 1,                   -- 1 = primera fila encabezado
@@ -1797,6 +1942,19 @@ BEGIN
 END;
 GO
 -- //////////////////////////////////////////////////////////////////////
+/*
+importacion.Sp_CargarPagosDesdeCsv
+Propósito: importar pagos desde CSV (monto, fecha, CBU/CVU, nroExpensa, etc.)
+
+Contrato/resumen:
+ - Parámetros de formato (Separador, RowTerminator, CodePage) y rutas
+ - @Verbose y @LogPath para seguimiento
+
+Notas:
+ - Valida CBU/CVU y normaliza importes; intenta mapear pagos a `app.Tbl_EstadoCuenta`
+     por idEstadoCuenta o por combinación (nroExpensa, nroUnidadFuncional).
+ - Manejar con cuidado en producción porque puede insertar muchos registros.
+*/
 CREATE OR ALTER PROCEDURE importacion.Sp_CargarPagosDesdeCsv
     @RutaArchivo      NVARCHAR(4000),
     @HDR              BIT           = 1,
@@ -2192,6 +2350,20 @@ GO
 -- //////////////////////////////////////////////////////////////////////
 -- Cargar un insert de lote de expensas y estado cuenta
 -- //////////////////////////////////////////////////////////////////////
+/*
+app.Sp_GenerarEstadoCuentaDesdeExpensas
+Propósito: Generar (materializar) registros en `app.Tbl_EstadoCuenta` a partir
+de las expensas existentes, creando el esqueleto por unidad funcional y
+estableciendo vencimientos y totales base.
+
+Contrato/resumen:
+ - Filtra por año/consorcio o por rango si se pasa parámetros.
+ - Inserta filas en `app.Tbl_EstadoCuenta` si no existen y actualiza fechas/valores.
+
+Notas:
+ - Es idempotente por diseño (evita duplicados) pero puede tocar muchas filas.
+ - Recomendado ejecutar en ventanas de baja carga si el dataset es grande.
+*/
 CREATE OR ALTER PROCEDURE app.Sp_GenerarEstadoCuentaDesdeExpensas
     @Anio    INT,
     @LogPath NVARCHAR(4000) = NULL,
@@ -2732,6 +2904,14 @@ BEGIN
 END
 GO
 -- //////////////////////////////////////////////////////////////////////
+/*
+app.Sp_CargarGastosExtraordinariosIniciales
+Propósito: insertar gastos extraordinarios de ejemplo para pruebas.
+
+Notas:
+ - Diseñado para entornos de testing; evita duplicados mediante checks.
+ - No ejecutar en producción salvo que sepas que quieres insertar datos de prueba.
+*/
 CREATE OR ALTER PROCEDURE app.Sp_CargarGastosExtraordinariosIniciales
     @Verbose BIT = 0
 AS
@@ -2887,6 +3067,16 @@ BEGIN
 END
 GO
 -- //////////////////////////////////////////////////////////////////////
+/*
+app.Sp_RecalcularMoraEstadosCuenta_Todo
+Propósito: recalcular la mora, intereses y totales para todos los estados de
+cuenta (o para un filtro específico). Utiliza la lógica de cálculo central.
+
+Notas operativas:
+ - Puede ser costoso: ejecutarlo con cuidado y preferentemente fuera de horario
+     pico. Si la base es grande, considerar hacerlo por consorcio o por rangos.
+ - Asegurarse de que los índices relevantes existan para reducir tiempo de CPU.
+*/
 CREATE OR ALTER PROCEDURE app.Sp_RecalcularMoraEstadosCuenta_Todo
 AS
 BEGIN
@@ -2954,6 +3144,15 @@ BEGIN
 END;
 GO
 -- //////////////////////////////////////////////////////////////////////
+/*
+reportes.Sp_ReporteEstadoFinanciero
+Propósito: generar un reporte consolidado del estado financiero por consorcio
+incluyendo saldos, recaudación y comparativos.
+
+Notas:
+ - Optimizado para consultas, evita operaciones que modifiquen datos.
+ - Si necesitás exportar, consumílo desde la capa de reporte.
+*/
 CREATE OR ALTER PROCEDURE reportes.Sp_ReporteEstadoFinanciero
     @Anio        INT,
     @IdConsorcio INT     = NULL,   -- NULL = todos
@@ -3113,6 +3312,14 @@ BEGIN
 END
 GO
 -- //////////////////////////////////////////////////////////////////////
+/*
+reportes.Sp_ReporteEstadoCuentasProrrateo
+Propósito: reportar el prorrateo de expensas por unidad funcional y el detalle
+de cómo se compone cada cuota.
+
+Notas:
+ - Útil para auditoría; evita cambios sobre tablas base.
+*/
 CREATE OR ALTER PROCEDURE reportes.Sp_ReporteEstadoCuentasProrrateo
     @IdConsorcio INT     = NULL,
     @Anio        INT     = NULL,
@@ -3182,3 +3389,149 @@ BEGIN
 END
 GO
 -- //////////////////////////////////////////////////////////////////////
+/*
+app.Sp_GenerarExpensaMesSiguienteSegunPagos
+Propósito: basándose en pagos y consumo, generar la expensa del mes siguiente
+con estimaciones y reglas de negocio internas.
+
+Notas:
+ - Contiene lógica de negocio que puede necesitar ajustes según reglas locales.
+ - Probar en entorno de staging antes de activar en producción.
+*/
+CREATE OR ALTER PROCEDURE app.Sp_GenerarExpensaMesSiguienteSegunPagos
+    @IdConsorcio     INT     = NULL,
+    @DiaVto1         TINYINT = 10,
+    @DiaVto2         TINYINT = 22,
+    @RegistrarEnvios BIT     = 1,
+    @ModoPrueba      BIT     = 1  -- hoy no bloqueamos por fecha real; queda para futuro
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    /* =========================
+       (A) INSERTAR EXPENSAS
+       ========================= */
+    ;WITH UltimoPago AS (
+        SELECT c.idConsorcio, MAX(p.fecha) AS ultPago
+        FROM app.Tbl_Consorcio c
+        LEFT JOIN app.Tbl_Pago p
+               ON p.idConsorcio = c.idConsorcio
+        WHERE (@IdConsorcio IS NULL OR c.idConsorcio = @IdConsorcio)
+        GROUP BY c.idConsorcio
+    ),
+    MesObjetivo AS (
+        SELECT up.idConsorcio,
+               DATEFROMPARTS(
+                    YEAR(DATEADD(MONTH, 1, COALESCE(up.ultPago, CONVERT(date, GETDATE())))),
+                    MONTH(DATEADD(MONTH, 1, COALESCE(up.ultPago, CONVERT(date, GETDATE())))),
+                    1
+               ) AS baseMes
+        FROM UltimoPago up
+    ),
+    FechasExpensa AS (
+        SELECT m.idConsorcio,
+               app.fn_NDiaHabil(YEAR(m.baseMes), MONTH(m.baseMes), 5)                                        AS fechaGeneracion,
+               app.fn_ProximoDiaHabil(DATEFROMPARTS(YEAR(m.baseMes), MONTH(m.baseMes), @DiaVto1))            AS fechaVto1,
+               CASE WHEN @DiaVto2 IS NULL THEN NULL
+                    ELSE app.fn_ProximoDiaHabil(DATEFROMPARTS(YEAR(m.baseMes), MONTH(m.baseMes), @DiaVto2))
+               END                                                                                           AS fechaVto2
+        FROM MesObjetivo m
+    )
+    INSERT INTO app.Tbl_Expensa (idConsorcio, fechaGeneracion, fechaVto1, fechaVto2, montoTotal)
+    SELECT
+        f.idConsorcio,
+        f.fechaGeneracion,
+        CASE WHEN f.fechaVto1 IS NULL OR f.fechaVto1 < f.fechaGeneracion THEN f.fechaGeneracion ELSE f.fechaVto1 END,
+        CASE 
+            WHEN f.fechaVto2 IS NULL THEN NULL
+            WHEN f.fechaVto1 IS NOT NULL AND f.fechaVto2 < f.fechaVto1 THEN f.fechaVto1
+            WHEN f.fechaVto2 < f.fechaGeneracion THEN f.fechaGeneracion
+            ELSE f.fechaVto2
+        END,
+        0.00
+    FROM FechasExpensa f
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM app.Tbl_Expensa e
+        WHERE e.idConsorcio     = f.idConsorcio
+          AND e.fechaGeneracion = f.fechaGeneracion
+    );
+
+    /* =========================
+       (B) REGISTRAR ENVIOS (si corresponde)
+       Ojo: el CTE va dentro del BEGIN y su INSERT lo consume inmediato
+       ========================= */
+    IF (@RegistrarEnvios = 1)
+    BEGIN
+        ;WITH UltimoPago AS (
+            SELECT c.idConsorcio, MAX(p.fecha) AS ultPago
+            FROM app.Tbl_Consorcio c
+            LEFT JOIN app.Tbl_Pago p
+                   ON p.idConsorcio = c.idConsorcio
+            WHERE (@IdConsorcio IS NULL OR c.idConsorcio = @IdConsorcio)
+            GROUP BY c.idConsorcio
+        ),
+        MesObjetivo AS (
+            SELECT up.idConsorcio,
+                   DATEFROMPARTS(
+                        YEAR(DATEADD(MONTH, 1, COALESCE(up.ultPago, CONVERT(date, GETDATE())))),
+                        MONTH(DATEADD(MONTH, 1, COALESCE(up.ultPago, CONVERT(date, GETDATE())))),
+                        1
+                   ) AS baseMes
+            FROM UltimoPago up
+        ),
+        FechasExpensa AS (
+            SELECT m.idConsorcio,
+                   app.fn_NDiaHabil(YEAR(m.baseMes), MONTH(m.baseMes), 5) AS fechaGeneracion
+            FROM MesObjetivo m
+        ),
+        TargetExp AS (
+            SELECT f.idConsorcio, e.nroExpensa, f.fechaGeneracion
+            FROM FechasExpensa f
+            JOIN app.Tbl_Expensa e
+              ON e.idConsorcio = f.idConsorcio
+             AND e.fechaGeneracion = f.fechaGeneracion
+        )
+        INSERT INTO app.Tbl_ExpensaEnvio
+            (idConsorcio, nroExpensa, idPersona, medio, email, telefono, observacion)
+            -- Si tu tabla usa 'canal' en lugar de 'medio', cambialo aquí ↑
+        SELECT
+            te.idConsorcio,
+            te.nroExpensa,
+            up.idPersona,
+            CASE
+                WHEN NULLIF(LTRIM(RTRIM(p.email)), '')    IS NOT NULL THEN 'EMAIL'
+                WHEN NULLIF(LTRIM(RTRIM(p.telefono)), '') IS NOT NULL THEN 'WHATSAPP'
+                ELSE 'IMPRESO'
+            END                                                  AS medio,
+            NULLIF(LTRIM(RTRIM(p.email)), '')                    AS email,
+            NULLIF(LTRIM(RTRIM(p.telefono)), '')                 AS telefono,
+            CASE WHEN up.esInquilino = 1 THEN N'Inquilino' ELSE N'Propietario' END AS observacion
+        FROM TargetExp te
+        JOIN app.Tbl_UFPersona up
+          ON up.idConsorcio = te.idConsorcio
+        JOIN app.Tbl_Persona p
+          ON p.idPersona = up.idPersona
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM app.Tbl_ExpensaEnvio ee
+            WHERE ee.idConsorcio = te.idConsorcio
+              AND ee.nroExpensa  = te.nroExpensa
+              AND ee.idPersona   = up.idPersona
+        );
+    END
+
+    /* =========================
+       (C) DEVOLUCION útil (opcional)
+       ========================= */
+    SELECT TOP (50) idConsorcio, nroExpensa, fechaGeneracion, fechaVto1, fechaVto2
+    FROM app.Tbl_Expensa
+    WHERE (@IdConsorcio IS NULL OR idConsorcio = @IdConsorcio)
+    ORDER BY fechaGeneracion DESC;
+
+    SELECT TOP (50) *
+    FROM app.Tbl_ExpensaEnvio
+    WHERE (@IdConsorcio IS NULL OR idConsorcio = @IdConsorcio)
+    ORDER BY idEnvio DESC;
+END
+GO

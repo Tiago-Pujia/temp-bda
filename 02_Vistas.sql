@@ -1,6 +1,23 @@
+/*
+Archivo: 02_Vistas.sql
+Propósito: Contiene vistas pensadas para reportes y resúmenes financieros.
+ - `app.vw_EstadoFinanciero` resume ingresos/egresos por expensa y calcula saldo acumulado
+     por consorcio (útil para reportes de cierre y control de caja).
+ - `app.Vw_PersonaSegura` es una vista segura que expone datos de personas con el
+     criterio de seguridad previsto (usa campos desencriptados si existen).
+
+Notas prácticas:
+ - Estas vistas son set-based y pensadas para lectura (SELECT) en reportes.
+ - Si las tablas subyacentes cambian (nuevas columnas o tipos), revisá el SELECT de cada
+     vista antes de recrearla.
+*/
+
 USE Com5600G13;
 GO
 
+-- Vista: resumen financiero por expensa
+-- Explica brevemente: agrupa expensas con gastos y pagos, calcula delta neto y saldo
+-- acumulado (saldoCierre) por consorcio. Ideal para paneles y exportes.
 CREATE OR ALTER VIEW app.vw_EstadoFinanciero AS
 WITH ExpensasConGastos AS (
     SELECT 
@@ -95,6 +112,9 @@ INNER JOIN app.Tbl_Consorcio C
 GO
 
 
+-- Vista: persona segura
+-- Devuelve los campos básicos de `Tbl_Persona`. Usar esta vista en reportes para
+-- evitar leer columnas cifradas o expuestas directamente.
 CREATE OR ALTER VIEW app.Vw_PersonaSegura
 AS
 SELECT

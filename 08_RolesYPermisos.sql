@@ -1,3 +1,14 @@
+/*
+Archivo: 08_RolesYPermisos.sql
+Propósito: Crea roles de base de datos, asigna permisos y usuarios (sin login).
+
+Resumen rápido:
+ - Define roles operativos (administrativo_general, administrativo_bancario,
+     administrativo_operativo, sistemas) y les asigna permisos mínimos necesarios.
+ - Incluye DENY explícitos para proteger datos sensibles (ej: app.Tbl_Persona).
+ - Revisá estos permisos si cambian las necesidades de acceso de las aplicaciones.
+*/
+
 USE [Com5600G13];
 GO
 

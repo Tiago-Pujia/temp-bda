@@ -1,3 +1,13 @@
+/*
+Archivo: 06_LotePruebas.sql
+Propósito: Script de datos de prueba (inserciones controladas) para facilitar
+pruebas funcionales del sistema: consorcios, unidades, expensas, pagos y estados.
+
+Notas:
+ - Está pensado para re-ejecuciones idempotentes (usa IF NOT EXISTS).
+ - Úsalo en ambientes de desarrollo; no recomendado para entornos productivos.
+*/
+
 USE Com5600G13;
 GO
 
