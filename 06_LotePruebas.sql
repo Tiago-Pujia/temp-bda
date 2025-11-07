@@ -1,11 +1,6 @@
 USE Com5600G13;
 GO
 
--- Cargar gastos extraordinarios iniciales (datos de prueba)
--- Inserta gastos extraordinarios de ejemplo para testing
-EXEC app.Sp_CargarGastosExtraordinariosIniciales @Verbose = 1;
-GO
-
 /* =========================================================
    1. CONSORCIOS DE PRUEBA
    ========================================================= */

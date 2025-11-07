@@ -1,13 +1,4 @@
-﻿/*
-    TODO: COMPLETAR CON DATOS DEL GRUPO
-    Trabajo Práctico Integrador - Bases de Datos Aplicada (3641)
-    Comisión: Com5600
-    Grupo: G13
-    Archivo: 51_Testing_LotePruebas_Expensas.sql
-    Enunciado: Juegos de prueba para validar el lote de datos de Expensas.
-*/
-
-USE Com5600G13;
+﻿USE Com5600G13;
 GO
 
 /* =========================================================

@@ -87,6 +87,11 @@ EXEC importacion.Sp_CargarPagosDesdeCsv
      @Verbose       = 1;
 GO
 
--- 9. Recalcular mora e intereses para todos los estados de cuenta
+-- 9. Cargar gastos extraordinarios iniciales (datos de prueba)
+-- Inserta gastos extraordinarios de ejemplo para testing
+EXEC app.Sp_CargarGastosExtraordinariosIniciales @Verbose = 1;
+GO
+
+-- 10. Recalcular mora e intereses para todos los estados de cuenta
 -- Actualiza deudas, intereses por mora y total a pagar
 EXEC app.Sp_RecalcularMoraEstadosCuenta_Todo;
