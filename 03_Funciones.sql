@@ -293,12 +293,59 @@ END;
 GO
 
 /**Descripta un alfanumerico y retorna un texto  **/
-CREATE OR ALTER FUNCTION seguridad.fn_DesencriptarTexto(@dato VARBINARY(512))
+CREATE OR ALTER FUNCTION seguridad.fn_EncriptarTexto(@texto NVARCHAR(4000))
+RETURNS VARBINARY(MAX)
+AS
+BEGIN
+    IF @texto IS NULL RETURN NULL;
+    RETURN ENCRYPTBYPASSPHRASE(N'Consorcio-2025-ClaveSecreta', @texto);
+END;
+GO
+
+/**Descripta un alfanumerico y retorna un texto  **/
+CREATE OR ALTER FUNCTION seguridad.fn_DesencriptarTexto(@dato VARBINARY(MAX))
 RETURNS NVARCHAR(4000)
 AS
 BEGIN
     IF @dato IS NULL RETURN NULL;
-
     RETURN CONVERT(NVARCHAR(4000), DECRYPTBYPASSPHRASE(N'Consorcio-2025-ClaveSecreta', @dato));
+END;
+GO
+
+CREATE OR ALTER FUNCTION app.fn_EsDiaHabil(@Fecha DATE)
+RETURNS BIT
+AS
+BEGIN
+    -- 0=Lunes ... 6=Domingo usando ancla 1900-01-01 (lunes)
+    DECLARE @dow INT = (DATEDIFF(DAY, '19000101', @Fecha) % 7 + 7) % 7;
+    IF @dow IN (5,6) RETURN 0; -- Sábado(5) o Domingo(6)
+    IF EXISTS (SELECT 1 FROM app.Tbl_Feriado WHERE fecha = @Fecha) RETURN 0;
+    RETURN 1;
+END;
+GO
+
+CREATE OR ALTER FUNCTION app.fn_SiguienteDiaHabil(@Fecha DATE)
+RETURNS DATE
+AS
+BEGIN
+    DECLARE @d DATE = @Fecha;
+    WHILE app.fn_EsDiaHabil(@d) = 0
+        SET @d = DATEADD(DAY, 1, @d);
+    RETURN @d;
+END;
+GO
+
+CREATE OR ALTER FUNCTION app.fn_QuintoDiaHabilDelMes(@Referencia DATE)
+RETURNS DATE
+AS
+BEGIN
+    DECLARE @d DATE = DATEFROMPARTS(YEAR(@Referencia), MONTH(@Referencia), 1);
+    DECLARE @c INT = 0;
+    WHILE @c < 5
+    BEGIN
+        IF app.fn_EsDiaHabil(@d) = 1 SET @c += 1;
+        IF @c < 5 SET @d = DATEADD(DAY, 1, @d);
+    END
+    RETURN @d;
 END;
 GO

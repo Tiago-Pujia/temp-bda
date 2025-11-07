@@ -19,7 +19,6 @@ GO
 
 -- 2. Cargar gastos ordinarios desde archivo Excel (hoja 'Proveedores$')
 -- Importa categorías de gastos y proveedores para cada consorcio
-/*
 EXEC importacion.Sp_CargarGastosDesdeExcel
     @RutaArchivo       = N'C:\sqlArchivos\datos varios.xlsx',
     @Hoja              = N'Proveedores$',
@@ -27,7 +26,6 @@ EXEC importacion.Sp_CargarGastosDesdeExcel
     @LogPath           = N'C:\sqlArchivos\gastos.log',
     @Verbose           = 1;
 GO
-*/
 
 -- 3. Cargar relación consorcio-unidades funcionales desde CSV
 -- Establece la relación entre consorcios y unidades funcionales con CBU/CVU
@@ -83,17 +81,12 @@ EXEC importacion.Sp_CargarPagosDesdeCsv
      @RutaArchivo   = N'C:\sqlArchivos\pagos_consorcios.csv',
      @HDR           = 1,
      @Separador     = ',', 
-     @RowTerminator = N'0x0d0a',
+     @RowTerminator = N'\n',
      @CodePage      = N'65001',
      @LogPath       = N'C:\sqlArchivos\pagos_csv.log',
      @Verbose       = 1;
 GO
 
--- 9. Cargar gastos extraordinarios iniciales (datos de prueba)
--- Inserta gastos extraordinarios de ejemplo para testing
-EXEC app.Sp_CargarGastosExtraordinariosIniciales @Verbose = 1;
-GO
-
--- 10. Recalcular mora e intereses para todos los estados de cuenta
+-- 9. Recalcular mora e intereses para todos los estados de cuenta
 -- Actualiza deudas, intereses por mora y total a pagar
 EXEC app.Sp_RecalcularMoraEstadosCuenta_Todo;

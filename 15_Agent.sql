@@ -7,6 +7,7 @@ EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;
    2. PROCEDIMIENTO: CARGAR FERIADOS DESDE API
 ============================================================ */
 
+GO
 CREATE OR ALTER PROCEDURE app.Sp_CargarFeriados
     @Anio INT
 AS
@@ -191,8 +192,7 @@ BEGIN
     JOIN app.Tbl_UnidadFuncional uf ON uf.idConsorcio = e.idConsorcio
     JOIN app.Tbl_UFPersona ufp ON ufp.idConsorcio = uf.idConsorcio
     JOIN app.Tbl_Persona p ON p.idPersona = ufp.idPersona
-    WHERE e.nroExpensa = @NroExpensa
-      AND (ufp.fechaFin IS NULL OR ufp.fechaFin >= e.fechaGeneracion);
+    WHERE e.nroExpensa = @NroExpensa;
 END;
 GO
 

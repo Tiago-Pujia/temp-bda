@@ -190,6 +190,445 @@ FROM OPENROWSET(
 END
 GO
 -- //////////////////////////////////////////////////////////////////////
+CREATE OR ALTER PROCEDURE app.Sp_ActualizarEstadoCuentaDesdeGastos
+  @idConsorcio  INT   = NULL,   -- NULL = todos
+  @nroExpensa   INT   = NULL,   -- NULL = todas
+  @desdeFecha   DATE  = NULL,   -- filtra por fechaGeneracion de la expensa
+  @hastaFecha   DATE  = NULL,
+  @incluirDummy BIT   = 0       -- 0 = ignora expensas 1900-01-01 o monto 0
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  -- Filtrado de expensas materializado (persistente para varias sentencias)
+  IF OBJECT_ID('tempdb..#FilExp') IS NOT NULL DROP TABLE #FilExp;
+
+  SELECT
+      e.idConsorcio,
+      e.nroExpensa,
+      e.fechaGeneracion,
+      e.fechaVto1
+  INTO #FilExp
+  FROM app.Tbl_Expensa e
+  WHERE (@idConsorcio IS NULL OR e.idConsorcio = @idConsorcio)
+    AND (@nroExpensa  IS NULL OR e.nroExpensa  = @nroExpensa)
+    AND (@desdeFecha  IS NULL OR e.fechaGeneracion >= @desdeFecha)
+    AND (@hastaFecha  IS NULL OR e.fechaGeneracion <= @hastaFecha)
+    AND (
+         @incluirDummy = 1
+         OR (e.fechaGeneracion <> '19000101' AND ISNULL(e.montoTotal,0) <> 0)
+    );
+
+  -- Si no hay nada que recalcular, salir
+  IF NOT EXISTS (SELECT 1 FROM #FilExp) RETURN;
+
+  ---------------------------------------------------------------------------
+  -- (0) Asegurar esqueleto UF×Expensa en EstadoCuenta para este filtro
+  ---------------------------------------------------------------------------
+  INSERT INTO app.Tbl_EstadoCuenta
+    (idConsorcio, nroUnidadFuncional, nroExpensa,
+     saldoAnterior, expensasOrdinarias, expensasExtraordinarias,
+     pagoRecibido, interesMora, deuda, totalAPagar, fecha)
+  SELECT
+     f.idConsorcio,
+     uf.idUnidadFuncional,
+     f.nroExpensa,
+     0,0,0,0,0,0,0,
+     ISNULL(f.fechaVto1, f.fechaGeneracion)
+  FROM #FilExp f
+  JOIN app.Tbl_UnidadFuncional uf
+       ON uf.idConsorcio = f.idConsorcio
+  LEFT JOIN app.Tbl_EstadoCuenta ec
+       ON ec.idConsorcio = uf.idConsorcio
+      AND ec.nroUnidadFuncional = uf.idUnidadFuncional
+      AND ec.nroExpensa = f.nroExpensa
+  WHERE ec.idEstadoCuenta IS NULL;
+
+  ---------------------------------------------------------------------------
+  -- (1) Normalizar la fecha de EC con la de la expensa
+  ---------------------------------------------------------------------------
+  UPDATE ec
+SET ec.fecha = ISNULL(e.fechaVto1, e.fechaGeneracion)
+FROM app.Tbl_EstadoCuenta ec
+JOIN app.Tbl_Expensa e
+  ON e.idConsorcio=ec.idConsorcio AND e.nroExpensa=ec.nroExpensa
+WHERE (@idConsorcio IS NULL OR e.idConsorcio=@idConsorcio)
+  AND (@nroExpensa IS NULL OR e.nroExpensa=@nroExpensa)
+  AND (@desdeFecha IS NULL OR e.fechaGeneracion>=@desdeFecha)
+  AND (@hastaFecha IS NULL OR e.fechaGeneracion<=@hastaFecha);
+
+  ---------------------------------------------------------------------------
+  -- (2) Totales por expensa y prorrateo por % de la UF
+  ---------------------------------------------------------------------------
+  ;WITH Tot AS (
+    SELECT g.idConsorcio, g.nroExpensa,
+           SUM(CASE WHEN g.tipo='Ordinario'      THEN g.importe ELSE 0 END) AS totOrd,
+           SUM(CASE WHEN g.tipo='Extraordinario' THEN g.importe ELSE 0 END) AS totExt
+    FROM app.Tbl_Gasto g
+    GROUP BY g.idConsorcio, g.nroExpensa
+  ),
+  SumUF AS (
+    SELECT idConsorcio,
+           SUM(CAST(porcentaje AS DECIMAL(18,6))) AS sumPorc
+    FROM app.Tbl_UnidadFuncional
+    GROUP BY idConsorcio
+  )
+  UPDATE ec
+  SET ec.expensasOrdinarias      = ROUND(ISNULL(t.totOrd,0) * (uf.porcentaje / NULLIF(su.sumPorc,0)), 2),
+      ec.expensasExtraordinarias = ROUND(ISNULL(t.totExt,0) * (uf.porcentaje / NULLIF(su.sumPorc,0)), 2),
+      ec.pagoRecibido            = ISNULL(ec.pagoRecibido,0),
+      ec.interesMora             = ISNULL(ec.interesMora,0),
+      ec.saldoAnterior           = ISNULL(ec.saldoAnterior,0)
+  FROM app.Tbl_EstadoCuenta ec
+  JOIN app.Tbl_UnidadFuncional uf
+    ON uf.idUnidadFuncional = ec.nroUnidadFuncional AND uf.idConsorcio = ec.idConsorcio
+  JOIN #FilExp f
+    ON f.idConsorcio = ec.idConsorcio AND f.nroExpensa = ec.nroExpensa
+  LEFT JOIN Tot t
+    ON t.idConsorcio = ec.idConsorcio AND t.nroExpensa = ec.nroExpensa
+  LEFT JOIN SumUF su
+    ON su.idConsorcio = ec.idConsorcio;
+
+  ---------------------------------------------------------------------------
+  -- (3) Encadenar saldoAnterior por UF (orden cronológico)
+  ---------------------------------------------------------------------------
+  ;WITH Base AS (
+    SELECT ec.idEstadoCuenta,
+           ec.idConsorcio, ec.nroUnidadFuncional, ec.nroExpensa,
+           e.fechaGeneracion,
+           (ISNULL(ec.expensasOrdinarias,0)
+          + ISNULL(ec.expensasExtraordinarias,0)
+          + ISNULL(ec.interesMora,0)
+          - ISNULL(ec.pagoRecibido,0)) AS totalMesSinSaldo
+    FROM app.Tbl_EstadoCuenta ec
+    JOIN app.Tbl_Expensa e
+      ON e.idConsorcio = ec.idConsorcio
+     AND e.nroExpensa  = ec.nroExpensa
+    JOIN #FilExp f
+      ON f.idConsorcio = e.idConsorcio
+     AND f.nroExpensa  = e.nroExpensa
+  ),
+  Ord AS (
+    SELECT b.*,
+           LAG(b.totalMesSinSaldo, 1, 0) OVER (
+             PARTITION BY b.idConsorcio, b.nroUnidadFuncional
+             ORDER BY b.fechaGeneracion, b.nroExpensa
+           ) AS saldoAntCalc
+    FROM Base b
+  )
+  UPDATE ec
+  SET ec.saldoAnterior = o.saldoAntCalc
+  FROM app.Tbl_EstadoCuenta ec
+  JOIN Ord o
+    ON o.idEstadoCuenta = ec.idEstadoCuenta;
+
+  ---------------------------------------------------------------------------
+  -- (4) Recalcular deuda y total a pagar
+  ---------------------------------------------------------------------------
+  ---------------------------------------------------------------------------
+  -- (4) Calcular interés por mora (si hay deuda y pasó vencimiento)
+  ---------------------------------------------------------------------------
+  ;WITH AggPagos AS (
+    SELECT 
+        p.idEstadoCuenta,
+        SUM(p.monto) AS montoPagado,
+        MAX(p.fecha) AS fechaUltimoPago
+    FROM app.Tbl_Pago p
+    WHERE p.idEstadoCuenta IS NOT NULL
+    GROUP BY p.idEstadoCuenta
+  )
+  UPDATE ec
+  SET 
+      -- Recalcular pago recibido desde Tbl_Pago
+      ec.pagoRecibido = ISNULL(ap.montoPagado, 0),
+      
+      -- Base del mes (ordinarias + extraordinarias)
+      ec.deuda = CASE 
+          WHEN (ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)) 
+               <= ISNULL(ap.montoPagado, 0) 
+          THEN 0
+          ELSE (ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)) 
+               - ISNULL(ap.montoPagado, 0)
+      END,
+      
+      -- Interés por mora según fecha de pago vs vencimientos
+      ec.interesMora = CASE
+          -- Si cubrió todo, no hay mora
+          WHEN (ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)) 
+               <= ISNULL(ap.montoPagado, 0) THEN 0
+          
+          -- Si no hay pagos, calcular mora según fecha actual vs vencimientos
+          WHEN ap.montoPagado IS NULL THEN
+              CASE 
+                  WHEN GETDATE() <= ex.fechaVto1 THEN 0
+                  WHEN GETDATE() > ex.fechaVto1 
+                       AND (ex.fechaVto2 IS NULL OR GETDATE() <= ex.fechaVto2)
+                       THEN ROUND(0.02 * (ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)), 2)
+                  WHEN ex.fechaVto2 IS NOT NULL AND GETDATE() > ex.fechaVto2
+                       THEN ROUND(0.05 * (ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)), 2)
+                  ELSE 0
+              END
+          
+          -- Si hay pagos, calcular según fecha último pago
+          WHEN ap.fechaUltimoPago <= ex.fechaVto1 THEN 0
+          WHEN ap.fechaUltimoPago > ex.fechaVto1
+               AND (ex.fechaVto2 IS NULL OR ap.fechaUltimoPago <= ex.fechaVto2)
+               THEN ROUND(0.02 * ((ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)) 
+                                   - ISNULL(ap.montoPagado, 0)), 2)
+          WHEN ex.fechaVto2 IS NOT NULL AND ap.fechaUltimoPago > ex.fechaVto2
+               THEN ROUND(0.05 * ((ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)) 
+                                   - ISNULL(ap.montoPagado, 0)), 2)
+          ELSE 0
+      END,
+      
+      -- Total a pagar = deuda + interés
+      ec.totalAPagar = 
+          CASE 
+              WHEN (ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)) 
+                   <= ISNULL(ap.montoPagado, 0) 
+              THEN 0
+              ELSE (ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)) 
+                   - ISNULL(ap.montoPagado, 0)
+          END
+          +
+          CASE
+              WHEN (ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)) 
+                   <= ISNULL(ap.montoPagado, 0) THEN 0
+              WHEN ap.montoPagado IS NULL THEN
+                  CASE 
+                      WHEN GETDATE() <= ex.fechaVto1 THEN 0
+                      WHEN GETDATE() > ex.fechaVto1 
+                           AND (ex.fechaVto2 IS NULL OR GETDATE() <= ex.fechaVto2)
+                           THEN ROUND(0.02 * (ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)), 2)
+                      WHEN ex.fechaVto2 IS NOT NULL AND GETDATE() > ex.fechaVto2
+                           THEN ROUND(0.05 * (ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)), 2)
+                      ELSE 0
+                  END
+              WHEN ap.fechaUltimoPago <= ex.fechaVto1 THEN 0
+              WHEN ap.fechaUltimoPago > ex.fechaVto1
+                   AND (ex.fechaVto2 IS NULL OR ap.fechaUltimoPago <= ex.fechaVto2)
+                   THEN ROUND(0.02 * ((ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)) 
+                                       - ISNULL(ap.montoPagado, 0)), 2)
+              WHEN ex.fechaVto2 IS NOT NULL AND ap.fechaUltimoPago > ex.fechaVto2
+                   THEN ROUND(0.05 * ((ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)) 
+                                       - ISNULL(ap.montoPagado, 0)), 2)
+              ELSE 0
+          END
+  FROM app.Tbl_EstadoCuenta ec
+  JOIN #FilExp f
+    ON f.idConsorcio = ec.idConsorcio
+   AND f.nroExpensa  = ec.nroExpensa
+  JOIN app.Tbl_Expensa ex
+    ON ex.idConsorcio = ec.idConsorcio
+   AND ex.nroExpensa  = ec.nroExpensa
+  LEFT JOIN AggPagos ap
+    ON ap.idEstadoCuenta = ec.idEstadoCuenta;
+
+END
+GO
+-- //////////////////////////////////////////////////////////////////////
+CREATE OR ALTER PROCEDURE importacion.Sp_CargarGastosDesdeExcel
+    @RutaArchivo       NVARCHAR(4000),            -- ej: C:\...\datos varios.xlsx
+    @Hoja              NVARCHAR(128) = N'Proveedores$', -- hoja de Excel
+    @UsarFechaExpensa  DATE = '19000101',         -- fecha de expensa a usar/crear
+    @LogPath           NVARCHAR(4000) = NULL,     -- opcional: archivo .log
+    @Verbose           BIT = 0                    -- 1 = logs INFO
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @Procedimiento SYSNAME = N'importacion.Sp_CargarGastosDesdeExcel';
+
+    BEGIN TRY
+        IF @Verbose = 1
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Inicio de proceso', NULL, @RutaArchivo, @LogPath;
+
+        -- 1) Normalizo hoja y proveedor de Excel (HDR=NO porque leemos B3:E...)
+        DECLARE @HojaOk NVARCHAR(128) = CASE WHEN RIGHT(ISNULL(@Hoja,N''),1)=N'$' THEN @Hoja ELSE @Hoja + N'$' END;
+
+        IF OBJECT_ID('tempdb..#ExcelCrudo') IS NOT NULL DROP TABLE #ExcelCrudo;
+        CREATE TABLE #ExcelCrudo
+        (
+            tipo_raw        NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,  -- Col B
+            descripcion_raw NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,  -- Col C
+            proveedor_raw   NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL,  -- Col D
+            consorcio_raw   NVARCHAR(255) COLLATE DATABASE_DEFAULT NULL   -- Col E (requerido)
+        );
+
+        DECLARE @Proveedor NVARCHAR(4000) =
+            N'Excel 12.0;HDR=NO;IMEX=1;Database=' + REPLACE(@RutaArchivo, N'''', N'''''');
+        DECLARE @Consulta NVARCHAR(4000) =
+			N'SELECT * FROM [' + @HojaOk + N']';
+
+        DECLARE @Sql NVARCHAR(MAX) = N'
+INSERT INTO #ExcelCrudo(tipo_raw, descripcion_raw, proveedor_raw, consorcio_raw)
+SELECT TRY_CAST(F1 AS NVARCHAR(255)),
+       TRY_CAST(F2 AS NVARCHAR(255)),
+       TRY_CAST(F3 AS NVARCHAR(255)),
+       TRY_CAST(F4 AS NVARCHAR(255))
+FROM OPENROWSET(''Microsoft.ACE.OLEDB.16.0'',
+                ' + QUOTENAME(@Proveedor,'''') + ',
+                ' + QUOTENAME(@Consulta, '''') + ');';
+
+        EXEC sys.sp_executesql @Sql;
+
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @Leidas INT = (SELECT COUNT(*) FROM #ExcelCrudo);
+            DECLARE @DetLeidas NVARCHAR(4000) = N'filas=' + CONVERT(NVARCHAR(20), @Leidas);
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Leídas filas desde Excel', @DetLeidas, @RutaArchivo, @LogPath;
+        END
+
+        -- 2) STAGING: tipado básico y mapeo a consorcio
+        IF OBJECT_ID('tempdb..#GastosStg') IS NOT NULL DROP TABLE #GastosStg;
+        CREATE TABLE #GastosStg
+        (
+            idConsorcio INT          NOT NULL,
+            categoria   VARCHAR(35)  COLLATE DATABASE_DEFAULT NULL,
+            descripcion VARCHAR(200) COLLATE DATABASE_DEFAULT NULL,
+            proveedor   VARCHAR(100) COLLATE DATABASE_DEFAULT NULL
+        );
+
+        INSERT INTO #GastosStg(idConsorcio, categoria, descripcion, proveedor)
+        SELECT
+            c.idConsorcio,
+            importacion.fn_LimpiarTexto(tipo_raw,        35),
+            importacion.fn_LimpiarTexto(descripcion_raw, 200),
+            importacion.fn_LimpiarTexto(proveedor_raw,   100)
+        FROM #ExcelCrudo r
+        JOIN app.Tbl_Consorcio c
+          ON c.nombre COLLATE DATABASE_DEFAULT =
+             importacion.fn_LimpiarTexto(r.consorcio_raw, 50)
+        WHERE importacion.fn_LimpiarTexto(r.consorcio_raw, 50) IS NOT NULL;
+
+        -- 3) Expensas: crear las que falten para @UsarFechaExpensa
+        IF OBJECT_ID('tempdb..#Expensas') IS NOT NULL DROP TABLE #Expensas;
+        CREATE TABLE #Expensas (idConsorcio INT PRIMARY KEY, nroExpensa INT NOT NULL);
+
+        -- existentes
+        INSERT INTO #Expensas(idConsorcio, nroExpensa)
+        SELECT e.idConsorcio, e.nroExpensa
+        FROM app.Tbl_Expensa e
+        JOIN (SELECT DISTINCT idConsorcio FROM #GastosStg) d ON d.idConsorcio = e.idConsorcio
+        WHERE e.fechaGeneracion = @UsarFechaExpensa;
+
+        -- crear faltantes
+        INSERT INTO app.Tbl_Expensa (idConsorcio, fechaGeneracion, fechaVto1, fechaVto2, montoTotal)
+        SELECT DISTINCT s.idConsorcio, @UsarFechaExpensa, NULL, NULL, 0
+        FROM #GastosStg s
+        WHERE NOT EXISTS (
+            SELECT 1 FROM app.Tbl_Expensa e
+            WHERE e.idConsorcio = s.idConsorcio AND e.fechaGeneracion = @UsarFechaExpensa
+        );
+
+        -- recargar todas a temp
+        DELETE FROM #Expensas;
+        INSERT INTO #Expensas(idConsorcio, nroExpensa)
+        SELECT e.idConsorcio, e.nroExpensa
+        FROM app.Tbl_Expensa e
+        JOIN (SELECT DISTINCT idConsorcio FROM #GastosStg) d ON d.idConsorcio = e.idConsorcio
+        WHERE e.fechaGeneracion = @UsarFechaExpensa;
+
+        -- 4) Insertar Gasto evitando duplicados (por consorcio+expensa+descripcion+proveedor+categoria)
+        DECLARE @GastosInsertados INT = 0;
+
+        INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
+        SELECT
+            x.nroExpensa,
+            s.idConsorcio,
+            'Ordinario',
+            s.descripcion,
+            CAST(GETDATE() AS DATE),
+            CAST(0 AS DECIMAL(10,2))
+        FROM #GastosStg s
+        JOIN #Expensas x ON x.idConsorcio = s.idConsorcio
+        WHERE NOT EXISTS
+        (
+            SELECT 1
+            FROM app.Tbl_Gasto g
+            LEFT JOIN app.Tbl_Gasto_Ordinario go2 ON go2.idGasto = g.idGasto
+            WHERE g.idConsorcio = s.idConsorcio
+              AND g.nroExpensa  = x.nroExpensa
+              AND ISNULL(g.descripcion,'')        COLLATE DATABASE_DEFAULT = ISNULL(s.descripcion,'')
+              AND ISNULL(go2.nombreProveedor,'')  COLLATE DATABASE_DEFAULT = ISNULL(s.proveedor,'')
+              AND ISNULL(go2.categoria,'')        COLLATE DATABASE_DEFAULT = ISNULL(s.categoria,'')
+        );
+
+        SET @GastosInsertados = @@ROWCOUNT;
+
+        -- 5) Crear detalle ordinario para esos gastos (si no existe)
+        INSERT INTO app.Tbl_Gasto_Ordinario (idGasto, nombreProveedor, categoria, nroFactura)
+        SELECT
+            g.idGasto,
+            s.proveedor,
+            s.categoria,
+            NULL
+        FROM app.Tbl_Gasto g
+        JOIN #Expensas x       ON x.nroExpensa = g.nroExpensa AND x.idConsorcio = g.idConsorcio
+        JOIN #GastosStg s      ON s.idConsorcio = g.idConsorcio
+                              AND ISNULL(g.descripcion,'') COLLATE DATABASE_DEFAULT = ISNULL(s.descripcion,'')
+        LEFT JOIN app.Tbl_Gasto_Ordinario go2 ON go2.idGasto = g.idGasto
+        WHERE g.tipo = 'Ordinario'
+          AND go2.idGasto IS NULL
+          AND g.fechaEmision = CAST(GETDATE() AS DATE)
+          AND g.importe = 0;
+
+        -- 6) Resumen y logs
+        DECLARE @TotalExcel INT = (SELECT COUNT(*) FROM #ExcelCrudo);
+        DECLARE @Validas    INT = (SELECT COUNT(*) FROM #GastosStg);
+
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @DetFin NVARCHAR(4000) =
+                N'gastos_insertados=' + CONVERT(NVARCHAR(20), @GastosInsertados) +
+                N'; filas_validas=' + CONVERT(NVARCHAR(20), @Validas) +
+                N'; filas_excel=' + CONVERT(NVARCHAR(20), @TotalExcel) +
+                N'; fecha_expensa=' + CONVERT(NVARCHAR(10), @UsarFechaExpensa, 120);
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Fin OK', @DetFin, @RutaArchivo, @LogPath;
+        END
+
+        /* ==== 6.bis) NUEVO: Recalcular Estado de Cuenta (set-based, sin cursores) ==== */
+        DECLARE @fecEC DATE = @UsarFechaExpensa;
+
+        EXEC app.Sp_ActualizarEstadoCuentaDesdeGastos
+             @idConsorcio  = NULL,
+             @nroExpensa   = NULL,
+             @desdeFecha   = @fecEC,
+             @hastaFecha   = @fecEC,
+             @incluirDummy = 0;
+
+        IF @Verbose = 1
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Recalc EstadoCuenta', N'OK (fecha única)', @RutaArchivo, @LogPath;
+        /* ==== FIN agregado ==== */
+
+        SELECT
+            filas_excel    = @TotalExcel,
+            filas_validas  = @Validas,
+            gastos_insert  = @GastosInsertados,
+            mensaje        = N'OK';
+    END TRY
+    BEGIN CATCH
+        DECLARE @MsgError NVARCHAR(4000) = ERROR_MESSAGE();
+        DECLARE @NroError INT            = ERROR_NUMBER();
+        DECLARE @Linea    INT            = ERROR_LINE();
+
+        DECLARE @DetError NVARCHAR(4000) =
+            N'Falla en importación (' + CONVERT(NVARCHAR(20), @NroError) +
+            N' en línea ' + CONVERT(NVARCHAR(20), @Linea) + N')';
+
+        EXEC reportes.Sp_LogReporte
+            @Procedimiento = @Procedimiento,
+            @Tipo          = 'ERROR',
+            @Mensaje       = @DetError,
+            @Detalle       = @MsgError,
+            @RutaArchivo   = @RutaArchivo,
+            @RutaLog       = @LogPath;
+
+        ;THROW;
+    END CATCH
+END
+GO
+-- //////////////////////////////////////////////////////////////////////
 CREATE OR ALTER PROCEDURE importacion.Sp_CargarGastosDesdeJson
     @RutaArchivo NVARCHAR(4000),
     @Anio        INT,
@@ -311,7 +750,6 @@ BEGIN
         /* 3) Mapa de extraordinarios (editable) */
         IF OBJECT_ID('tempdb..#map_extra') IS NOT NULL DROP TABLE #map_extra;
         CREATE TABLE #map_extra (categoria NVARCHAR(100) COLLATE DATABASE_DEFAULT PRIMARY KEY);
-        INSERT INTO #map_extra(categoria) VALUES (N'GASTOS GENERALES');
 
         /* 4) Consorcios: crear los faltantes */
         ;WITH cte_cons AS (
@@ -512,6 +950,21 @@ BEGIN
                 N'; extraordinarios=' + CONVERT(NVARCHAR(20), @ExtIns);
             EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Subtablas cargadas', @DetSub, @RutaArchivo, @LogPath;
         END
+
+        /* ==== 8.bis) NUEVO: Recalcular Estado de Cuenta (set-based, sin cursores) ==== */
+        DECLARE @fecDesde DATE = DATEFROMPARTS(@Anio, 1, 1);
+        DECLARE @fecHasta DATE = DATEFROMPARTS(@Anio, 12, 31);
+
+        EXEC app.Sp_ActualizarEstadoCuentaDesdeGastos
+             @idConsorcio  = NULL,
+             @nroExpensa   = NULL,
+             @desdeFecha   = @fecDesde,
+             @hastaFecha   = @fecHasta,
+             @incluirDummy = 0;
+
+        IF @Verbose = 1
+            EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Recalc EstadoCuenta', N'OK (rango anual)', @RutaArchivo, @LogPath;
+        /* ==== FIN agregado ==== */
 
         /* 9) Fin + resumen */
         DECLARE @Resumen NVARCHAR(4000) =
@@ -985,7 +1438,6 @@ BEGIN
     END CATCH
 END
 GO
-
 -- //////////////////////////////////////////////////////////////////////
 CREATE OR ALTER PROCEDURE importacion.Sp_CargarUFInquilinosDesdeCsv
     @RutaArchivo    NVARCHAR(4000),            -- C:\...\Inquilino-propietarios-datos.csv
@@ -1001,6 +1453,7 @@ BEGIN
     DECLARE @Procedimiento SYSNAME = N'importacion.Sp_CargarUFInquilinosDesdeCsv';
 
     BEGIN TRY
+        /* 0) Log inicio */
         IF @Verbose = 1
         BEGIN
             DECLARE @Det0 NVARCHAR(4000) = NULL;
@@ -1011,7 +1464,7 @@ BEGIN
                  @Detalle       = @Det0,
                  @RutaArchivo   = @RutaArchivo,
                  @RutaLog       = @LogPath;
-        END
+        END;
 
         /* 1) RAW del CSV (';') */
         IF OBJECT_ID('tempdb..#Raw','U') IS NOT NULL DROP TABLE #Raw;
@@ -1026,7 +1479,7 @@ BEGIN
             [Inquilino]              NVARCHAR(50)  COLLATE DATABASE_DEFAULT NULL
         );
 
-        DECLARE @PrimeraFila INT = CASE WHEN @HDR=1 THEN 2 ELSE 1 END;
+        DECLARE @PrimeraFila INT = CASE WHEN @HDR = 1 THEN 2 ELSE 1 END;
         DECLARE @PrimeraFilaTxt NVARCHAR(10) = CONVERT(NVARCHAR(10), @PrimeraFila);
         DECLARE @RutaEsc NVARCHAR(4000) = REPLACE(@RutaArchivo, N'''', N'''''');
 
@@ -1053,9 +1506,9 @@ BEGIN
                  @Detalle       = @Det1,
                  @RutaArchivo   = @RutaArchivo,
                  @RutaLog       = @LogPath;
-        END
+        END;
 
-        /* 2) STAGING: normalizar CBU/CVU (22 dígitos) y mapear inquilino */
+        /* 2) STAGING: normalizar CBU/CVU (22 dígitos) y mapear inquilino / propietario */
         IF OBJECT_ID('tempdb..#Stg','U') IS NOT NULL DROP TABLE #Stg;
         CREATE TABLE #Stg
         (
@@ -1087,11 +1540,12 @@ BEGIN
                     REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
                         s.cbu_raw,' ',''),'-',''),'.',''),'/',''),'\',''),'_',''),
                         '(' ,''),')',''),CHAR(9),''),CHAR(160),''),
+
                 inq_norm = LOWER(s.inq_raw),
                 dni_norm = TRY_CONVERT(INT, NULLIF(s.dni_raw,'')),
                 nom_norm = NULLIF(s.nom_raw,''),
                 ape_norm = NULLIF(s.ape_raw,''),
-                mail_norm= NULLIF(s.mail_raw,''),
+                mail_norm = NULLIF(importacion.fn_NormalizarEmail(s.mail_raw), ''),
                 tel_norm =
                     NULLIF(REPLACE(REPLACE(REPLACE(REPLACE(s.tel_raw,' ',''),'-',''),'(',''),')',''), '')
             FROM s
@@ -1106,13 +1560,15 @@ BEGIN
             n.dni_norm,
             CASE WHEN n.nom_norm  IS NULL THEN NULL ELSE LEFT(n.nom_norm ,100) END,
             CASE WHEN n.ape_norm  IS NULL THEN NULL ELSE LEFT(n.ape_norm ,100) END,
-			CASE
+            CASE
                 WHEN n.mail_norm IS NULL THEN NULL
-                WHEN importacion.fn_EmailValido(n.mail_norm) = 1
-                     THEN LEFT(n.mail_norm, 255)
-                ELSE NULL
+                -- si no tiene @, lo descartamos
+                WHEN CHARINDEX('@', n.mail_norm) = 0 THEN NULL
+                -- si no hay punto después del @, también lo descartamos
+                WHEN CHARINDEX('.', n.mail_norm, CHARINDEX('@', n.mail_norm) + 1) = 0 THEN NULL
+                ELSE LEFT(n.mail_norm, 255)
             END,
-			CASE WHEN n.tel_norm  IS NULL THEN NULL ELSE LEFT(n.tel_norm ,50)  END
+            CASE WHEN n.tel_norm  IS NULL THEN NULL ELSE LEFT(n.tel_norm ,50)  END
         FROM n
         WHERE n.cbu_norm IS NOT NULL
           AND LEN(n.cbu_norm)=22
@@ -1132,147 +1588,203 @@ BEGIN
                  @Detalle       = @Det2,
                  @RutaArchivo   = @RutaArchivo,
                  @RutaLog       = @LogPath;
-        END
+        END;
 
-        /* 3) INSERTAR faltantes en app.Tbl_Persona (usa IDX_CVU_CBU_PERSONA) */
+                /* 3) UPSERT en app.Tbl_Persona (UPDATE + INSERT, dinámico según columnas reales) */
+
         DECLARE @ColsTarget NVARCHAR(MAX) = N'CBU_CVU';
         DECLARE @ColsSource NVARCHAR(MAX) = N's.cbu_cvu';
+        DECLARE @SetList    NVARCHAR(MAX) = N'';
 
+        -- Armamos dinámicamente las columnas opcionales
         IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'dni')
         BEGIN
             SET @ColsTarget = CONCAT(@ColsTarget, N', dni');
             SET @ColsSource = CONCAT(@ColsSource, N', s.dni');
-        END
+            SET @SetList    = CONCAT(@SetList,
+                                     CASE WHEN @SetList = N'' THEN N'' ELSE N', ' END,
+                                     N'p.dni = COALESCE(s.dni, p.dni)');
+        END;
 
         IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'nombre')
         BEGIN
             SET @ColsTarget = CONCAT(@ColsTarget, N', nombre');
             SET @ColsSource = CONCAT(@ColsSource, N', s.nombre');
-        END
+            SET @SetList    = CONCAT(@SetList,
+                                     CASE WHEN @SetList = N'' THEN N'' ELSE N', ' END,
+                                     N'p.nombre = COALESCE(s.nombre, p.nombre)');
+        END;
 
         IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'apellido')
         BEGIN
             SET @ColsTarget = CONCAT(@ColsTarget, N', apellido');
             SET @ColsSource = CONCAT(@ColsSource, N', s.apellido');
-        END
+            SET @SetList    = CONCAT(@SetList,
+                                     CASE WHEN @SetList = N'' THEN N'' ELSE N', ' END,
+                                     N'p.apellido = COALESCE(s.apellido, p.apellido)');
+        END;
 
         IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'email')
         BEGIN
             SET @ColsTarget = CONCAT(@ColsTarget, N', email');
             SET @ColsSource = CONCAT(@ColsSource, N', s.email');
-        END
+            SET @SetList    = CONCAT(@SetList,
+                                     CASE WHEN @SetList = N'' THEN N'' ELSE N', ' END,
+                                     N'p.email = COALESCE(s.email, p.email)');
+        END;
 
         IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('app.Tbl_Persona') AND name = 'telefono')
         BEGIN
             SET @ColsTarget = CONCAT(@ColsTarget, N', telefono');
             SET @ColsSource = CONCAT(@ColsSource, N', s.telefono');
-        END
+            SET @SetList    = CONCAT(@SetList,
+                                     CASE WHEN @SetList = N'' THEN N'' ELSE N', ' END,
+                                     N'p.telefono = COALESCE(s.telefono, p.telefono)');
+        END;
+
+        ---------------------------------------------------------
+        -- 3.a) UPDATE de personas ya existentes (mismo CBU_CVU)
+        ---------------------------------------------------------
+        DECLARE @PersonasActualizadas INT = 0;
+        DECLARE @SqlUpdPer NVARCHAR(MAX);
+
+        IF @SetList <> N''
+        BEGIN
+            SET @SqlUpdPer =
+                CONCAT(
+                    N'UPDATE p SET ', @SetList, N' ',
+                    N'FROM app.Tbl_Persona p ',
+                    N'JOIN #Stg s ON s.cbu_cvu = p.CBU_CVU;'
+                );
+
+            EXEC (@SqlUpdPer);
+            SET @PersonasActualizadas = @@ROWCOUNT;
+        END;
+
+        ---------------------------------------------------------
+        -- 3.b) INSERT solo de las personas que faltan (por CBU)
+        ---------------------------------------------------------
+        DECLARE @PersonasNuevas INT =
+        (
+            SELECT COUNT(*)
+            FROM (
+                SELECT DISTINCT s.cbu_cvu
+                FROM #Stg s
+                WHERE s.cbu_cvu IS NOT NULL
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM app.Tbl_Persona p
+                        WHERE p.CBU_CVU = s.cbu_cvu
+                  )
+            ) q
+        );
 
         DECLARE @SqlInsPer NVARCHAR(MAX) =
-    CONCAT(
-        N'INSERT INTO app.Tbl_Persona (', @ColsTarget, N') ',
-        N'SELECT ', @ColsSource, N' ',
-        N'FROM #Stg s ',
-        N'WHERE NOT EXISTS (SELECT 1 FROM app.Tbl_Persona p WHERE p.CBU_CVU = s.cbu_cvu);'
-    );
+            CONCAT(
+                N'INSERT INTO app.Tbl_Persona (', @ColsTarget, N') ',
+                N'SELECT ', @ColsSource, N' ',
+                N'FROM #Stg s ',
+                N'WHERE s.cbu_cvu IS NOT NULL ',
+                N'  AND NOT EXISTS (SELECT 1 FROM app.Tbl_Persona p WHERE p.CBU_CVU = s.cbu_cvu);'
+            );
 
         EXEC (@SqlInsPer);
 
         IF @Verbose = 1
         BEGIN
-            DECLARE @NuevasPersonas INT =
-                (SELECT COUNT(*) FROM #Stg s
-                 WHERE NOT EXISTS (SELECT 1 FROM app.Tbl_Persona p WHERE p.CBU_CVU = s.cbu_cvu));
-            DECLARE @Det3 NVARCHAR(4000) = CONCAT(N'personas_nuevas=', CONVERT(NVARCHAR(20), @NuevasPersonas));
+            DECLARE @Det3 NVARCHAR(4000) =
+                CONCAT(N'personas_actualizadas=', CONVERT(NVARCHAR(20), @PersonasActualizadas),
+                       N'; personas_nuevas=',      CONVERT(NVARCHAR(20), @PersonasNuevas));
             EXEC reportes.Sp_LogReporte
                  @Procedimiento = @Procedimiento,
                  @Tipo          = 'INFO',
-                 @Mensaje       = N'Personas insertadas (faltantes)',
+                 @Mensaje       = N'Personas upsert (update + insert)',
                  @Detalle       = @Det3,
                  @RutaArchivo   = @RutaArchivo,
                  @RutaLog       = @LogPath;
-        END
+        END;
 
-        /* 4) VINCULAR Persona y Consorcio por el MISMO CBU_CVU y upsert en UFPersona (sin idUnidadFuncional) */
-IF OBJECT_ID('tempdb.#MatchCBU','U') IS NOT NULL DROP TABLE #MatchCBU;
-CREATE TABLE #MatchCBU
-(
-    idPersona    INT NOT NULL,
-    idConsorcio  INT NOT NULL,
-    esInquilino  BIT NOT NULL
-);
+        /* 4) VINCULAR Persona y Consorcio por el MISMO CBU_CVU y upsert en UFPersona */
+        IF OBJECT_ID('tempdb..#MatchCBU','U') IS NOT NULL DROP TABLE #MatchCBU;
+        CREATE TABLE #MatchCBU
+        (
+            idPersona    INT NOT NULL,
+            idConsorcio  INT NOT NULL,
+            esInquilino  BIT NOT NULL
+        );
 
-INSERT INTO #MatchCBU (idPersona, idConsorcio, esInquilino)
-SELECT
-    p.idPersona,
-    u.idConsorcio,
-    s.esInquilino
-FROM #Stg s
-JOIN app.Tbl_Persona p ON p.CBU_CVU = s.cbu_cvu
-JOIN app.Tbl_UnidadFuncional u WITH (INDEX = UQ_UnidadFuncional_CBU_CVU) ON u.CBU_CVU = s.cbu_cvu;
-
-IF @Verbose = 1
-BEGIN
-    DECLARE @Det4 NVARCHAR(4000) = CONCAT(N'matcheos_cbu=', (SELECT COUNT(*) FROM #MatchCBU));
-    EXEC reportes.Sp_LogReporte @Procedimiento, 'INFO', N'Match Persona↔Consorcio por CBU', @Det4, @RutaArchivo, @LogPath;
-END
-
--- UPDATE si ya existe (idPersona + idConsorcio)
-UPDATE uf
-   SET uf.esInquilino = m.esInquilino
-FROM app.Tbl_UFPersona uf
-JOIN #MatchCBU m
-  ON m.idPersona = uf.idPersona
- AND m.idConsorcio = uf.idConsorcio;
-
-DECLARE @RowsUpd INT = @@ROWCOUNT;
-
--- INSERT si no existe (idPersona + idConsorcio)
-INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino)
-SELECT m.idPersona, m.idConsorcio, m.esInquilino,
-FROM #MatchCBU m
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM app.Tbl_UFPersona uf
-    WHERE uf.idPersona   = m.idPersona
-      AND uf.idConsorcio = m.idConsorcio
-);
-
-DECLARE @RowsIns INT = @@ROWCOUNT;
-
-        /* 5) Resumen */
-        DECLARE @TotCsv INT = (SELECT COUNT(*) FROM #Raw);
-        DECLARE @TotStg INT = (SELECT COUNT(*) FROM #Stg);
-        DECLARE @TotMatchCBU INT = (SELECT COUNT(*) FROM #MatchCBU);
+        INSERT INTO #MatchCBU (idPersona, idConsorcio, esInquilino)
+        SELECT
+            p.idPersona,
+            u.idConsorcio,
+            s.esInquilino
+        FROM #Stg s
+        JOIN app.Tbl_Persona        p ON p.CBU_CVU = s.cbu_cvu
+        JOIN app.Tbl_UnidadFuncional u WITH (INDEX = UQ_UnidadFuncional_CBU_CVU)
+          ON u.CBU_CVU = s.cbu_cvu;
 
         IF @Verbose = 1
         BEGIN
-            DECLARE @Det5 NVARCHAR(4000) =
-                CONCAT(N'csv=', @TotCsv,
-                       N'; stg=', @TotStg,
-                       N'; match_cbu=', @TotMatchCBU,
-                       N'; uf_upd=', @RowsUpd,
-                       N'; uf_ins=', @RowsIns);
+            DECLARE @Det4 NVARCHAR(4000) =
+                CONCAT(N'matcheos_cbu=', CONVERT(NVARCHAR(20), (SELECT COUNT(*) FROM #MatchCBU)));
             EXEC reportes.Sp_LogReporte
-                 @Procedimiento = @Procedimiento,
-                 @Tipo          = 'INFO',
-                 @Mensaje       = N'Fin OK',
-                 @Detalle       = @Det5,
-                 @RutaArchivo   = @RutaArchivo,
-                 @RutaLog       = @LogPath;
-        END
+                 @Procedimiento, 'INFO',
+                 N'Match Persona↔Consorcio por CBU', @Det4, @RutaArchivo, @LogPath;
+        END;
+
+        -- UPDATE si ya existe (idPersona + idConsorcio)
+        UPDATE uf
+           SET uf.esInquilino = m.esInquilino
+        FROM app.Tbl_UFPersona uf
+        JOIN #MatchCBU m
+          ON m.idPersona   = uf.idPersona
+         AND m.idConsorcio = uf.idConsorcio;
+
+        DECLARE @RowsUpd INT = @@ROWCOUNT;
+
+        -- INSERT si no existe (idPersona + idConsorcio)
+        INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino)
+        SELECT m.idPersona, m.idConsorcio, m.esInquilino
+        FROM #MatchCBU m
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM app.Tbl_UFPersona uf
+            WHERE uf.idPersona   = m.idPersona
+              AND uf.idConsorcio = m.idConsorcio
+        );
+
+        DECLARE @RowsIns INT = @@ROWCOUNT;
+
+        /* 5) Resumen final */
+        DECLARE @TotCsv    INT = (SELECT COUNT(*) FROM #Raw);
+        DECLARE @TotStg    INT = (SELECT COUNT(*) FROM #Stg);
+        DECLARE @TotMatch  INT = (SELECT COUNT(*) FROM #MatchCBU);
+
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @DetFin NVARCHAR(4000) =
+                CONCAT(N'csv=',        CONVERT(NVARCHAR(20), @TotCsv),
+                       N'; stg=',      CONVERT(NVARCHAR(20), @TotStg),
+                       N'; match_cbu=',CONVERT(NVARCHAR(20), @TotMatch),
+                       N'; uf_upd=',   CONVERT(NVARCHAR(20), @RowsUpd),
+                       N'; uf_ins=',   CONVERT(NVARCHAR(20), @RowsIns));
+            EXEC reportes.Sp_LogReporte
+                 @Procedimiento, 'INFO',
+                 N'Fin OK', @DetFin, @RutaArchivo, @LogPath;
+        END;
 
         SELECT
-            filas_csv_total           = @TotCsv,
-            filas_validas_stg         = @TotStg,
-            vinculos_por_cbu          = @TotMatchCBU,
-            uf_actualizadas           = @RowsUpd,
-            uf_insertadas             = @RowsIns,
-            mensaje                   = N'OK';
+            filas_csv_total   = @TotCsv,
+            filas_validas_stg = @TotStg,
+            vinculos_por_cbu  = @TotMatch,
+            uf_actualizadas   = @RowsUpd,
+            uf_insertadas     = @RowsIns,
+            mensaje           = N'OK';
     END TRY
     BEGIN CATCH
         DECLARE @MsgError NVARCHAR(4000) = ERROR_MESSAGE();
-        DECLARE @DetErr NVARCHAR(4000) = CONCAT(N'Error en línea ', CONVERT(NVARCHAR(10), ERROR_LINE()));
+        DECLARE @DetErr  NVARCHAR(4000) =
+            CONCAT(N'Error en línea ', CONVERT(NVARCHAR(10), ERROR_LINE()));
         EXEC reportes.Sp_LogReporte
             @Procedimiento = @Procedimiento,
             @Tipo          = 'ERROR',
@@ -1282,7 +1794,7 @@ DECLARE @RowsIns INT = @@ROWCOUNT;
             @RutaLog       = @LogPath;
         THROW;
     END CATCH
-END
+END;
 GO
 -- //////////////////////////////////////////////////////////////////////
 CREATE OR ALTER PROCEDURE importacion.Sp_CargarPagosDesdeCsv
@@ -1503,6 +2015,8 @@ BEGIN
            OR idConsorcio IS NULL
            OR nroExpensa IS NULL;
 
+           SELECT * FROM app.Tbl_EstadoCuenta;
+
         /* Registrar filas sin EstadoCuenta */
         INSERT INTO #errores (motivo, fecha_txt, cbu_txt, valor_txt)
         SELECT
@@ -1675,31 +2189,113 @@ BEGIN
     END CATCH
 END
 GO
-
-
 -- //////////////////////////////////////////////////////////////////////
 -- Cargar un insert de lote de expensas y estado cuenta
 -- //////////////////////////////////////////////////////////////////////
-IF OBJECT_ID('importacion.Tbl_Pago_No_Asociado', 'U') IS NULL
+CREATE OR ALTER PROCEDURE app.Sp_GenerarEstadoCuentaDesdeExpensas
+    @Anio    INT,
+    @LogPath NVARCHAR(4000) = NULL,
+    @Verbose BIT = 1
+AS
 BEGIN
-    CREATE TABLE importacion.Tbl_Pago_No_Asociado
-    (
-        idPagoNoAsociado INT IDENTITY(1,1) PRIMARY KEY,
-        fechaRegistro    DATETIME2(0) NOT NULL CONSTRAINT DF_PagoNoAsoc_fechaRegistro DEFAULT SYSDATETIME(),
-        motivo           NVARCHAR(200)  COLLATE DATABASE_DEFAULT NULL,
-        fecha_txt        NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
-        cbu_txt          NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
-        valor_txt        NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
-        rutaArchivo      NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL
-    );
+    SET NOCOUNT ON;
+
+    DECLARE @Procedimiento SYSNAME = N'app.Sp_GenerarEstadoCuentaDesdeExpensas';
+
+    BEGIN TRY
+        IF @Verbose = 1
+            EXEC reportes.Sp_LogReporte
+                 @Procedimiento, 'INFO',
+                 N'Inicio generación EstadosCuenta', NULL, NULL, @LogPath;
+
+        /* 1) Expensas del año indicado */
+        IF OBJECT_ID('tempdb..#exp_anio') IS NOT NULL DROP TABLE #exp_anio;
+
+        SELECT
+            e.idConsorcio,
+            e.nroExpensa,
+            e.fechaGeneracion
+        INTO #exp_anio
+        FROM app.Tbl_Expensa e
+        WHERE YEAR(e.fechaGeneracion) = @Anio;
+
+        DECLARE @ExpensasAnio INT = (SELECT COUNT(*) FROM #exp_anio);
+
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @DetExp NVARCHAR(4000) =
+                N'expensas_anio=' + CONVERT(NVARCHAR(20), @ExpensasAnio);
+            EXEC reportes.Sp_LogReporte
+                 @Procedimiento, 'INFO',
+                 N'Expensas a procesar', @DetExp, NULL, @LogPath;
+        END
+
+        /* 2) Crear EstadosCuenta para cada UF de cada expensa (evitando duplicados) */
+        INSERT INTO app.Tbl_EstadoCuenta (nroUnidadFuncional, idConsorcio, nroExpensa)
+        SELECT
+            uf.idUnidadFuncional         AS nroUnidadFuncional,
+            ea.idConsorcio,
+            ea.nroExpensa
+        FROM #exp_anio ea
+        JOIN app.Tbl_UnidadFuncional uf
+          ON uf.idConsorcio = ea.idConsorcio
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM app.Tbl_EstadoCuenta ec
+            WHERE ec.nroUnidadFuncional = uf.idUnidadFuncional
+              AND ec.idConsorcio       = ea.idConsorcio
+              AND ec.nroExpensa        = ea.nroExpensa
+        );
+
+        DECLARE @EstadosCreados INT = @@ROWCOUNT;
+
+        IF @Verbose = 1
+        BEGIN
+            DECLARE @DetEC NVARCHAR(4000) =
+                N'estados_creados=' + CONVERT(NVARCHAR(20), @EstadosCreados);
+            EXEC reportes.Sp_LogReporte
+                 @Procedimiento, 'INFO',
+                 N'EstadosCuenta generados', @DetEC, NULL, @LogPath;
+        END
+
+        /* 3) Fin + resumen */
+        DECLARE @Resumen NVARCHAR(4000) =
+            N'expensas_anio=' + CONVERT(NVARCHAR(20), @ExpensasAnio) +
+            N'; estados_creados=' + CONVERT(NVARCHAR(20), @EstadosCreados);
+
+        IF @Verbose = 1
+            EXEC reportes.Sp_LogReporte
+                 @Procedimiento, 'INFO',
+                 N'Fin OK', @Resumen, NULL, @LogPath;
+
+        SELECT
+            expensas_anio     = @ExpensasAnio,
+            estados_creados   = @EstadosCreados,
+            mensaje           = N'OK';
+    END TRY
+    BEGIN CATCH
+        DECLARE @MsgError NVARCHAR(4000) = ERROR_MESSAGE();
+        DECLARE @DetErr  NVARCHAR(4000) =
+            N'Error en línea ' + CONVERT(NVARCHAR(10), ERROR_LINE());
+
+        EXEC reportes.Sp_LogReporte
+            @Procedimiento = @Procedimiento,
+            @Tipo          = 'ERROR',
+            @Mensaje       = @DetErr,
+            @Detalle       = @MsgError,
+            @RutaArchivo   = NULL,
+            @RutaLog       = @LogPath;
+
+        THROW;
+    END CATCH
 END
 GO
-
+-- //////////////////////////////////////////////////////////////////////
 CREATE OR ALTER PROCEDURE importacion.Sp_CargarPagosDesdeCsv
     @RutaArchivo      NVARCHAR(4000),
     @HDR              BIT           = 1,
     @Separador        CHAR(1)       = ',',
-    @RowTerminator    NVARCHAR(10)  = N'0x0d0a',
+    @RowTerminator    NVARCHAR(10)  = '\n',
     @CodePage         NVARCHAR(16)  = N'65001',
     @LogPath          NVARCHAR(4000) = NULL,
     @Verbose          BIT           = 1
@@ -1728,9 +2324,7 @@ BEGIN
             c1 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
             c2 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
             c3 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
-            c4 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
-            c5 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL,
-            c6 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL
+            c4 NVARCHAR(4000) COLLATE DATABASE_DEFAULT NULL
         );
 
         CREATE TABLE #norm (
@@ -1745,7 +2339,7 @@ BEGIN
             id_norm     INT           NOT NULL,
             fecha       DATE          NOT NULL,
             CBU_CVU     CHAR(22)      COLLATE DATABASE_DEFAULT NOT NULL,
-            valor       DECIMAL(12,2) NOT NULL  -- un pelín más amplio
+            valor       DECIMAL(12,2) NOT NULL
         );
 
         CREATE TABLE #errores (
@@ -1766,6 +2360,7 @@ BEGIN
                 N', FIELDTERMINATOR = ''', @Separador, N'''',
                 N', ROWTERMINATOR  = ''', @RowTerminator, N'''',
                 N', CODEPAGE       = ''', @CodePage, N'''',
+                N', FIELDQUOTE     = ''"''',
                 N', TABLOCK );'
             );
 
@@ -1779,7 +2374,16 @@ BEGIN
             THROW;
         END CATCH
 
+        /* Limpieza de caracteres especiales */
+        UPDATE r
+           SET c1 = REPLACE(REPLACE(REPLACE(c1, CHAR(13), N''), CHAR(10), N''), NCHAR(65279), N''),
+               c2 = REPLACE(REPLACE(REPLACE(c2, CHAR(13), N''), CHAR(10), N''), NCHAR(65279), N''),
+               c3 = REPLACE(REPLACE(REPLACE(c3, CHAR(13), N''), CHAR(10), N''), NCHAR(65279), N''),
+               c4 = REPLACE(REPLACE(REPLACE(c4, CHAR(13), N''), CHAR(10), N''), NCHAR(65279), N'')
+        FROM #raw r;
+
         DECLARE @FilasRaw INT = (SELECT COUNT(*) FROM #raw);
+
         IF @Verbose = 1
         BEGIN
             DECLARE @DetRaw NVARCHAR(4000) =
@@ -1791,11 +2395,12 @@ BEGIN
         /* =============================== 2) Normalización =============================== */
         INSERT INTO #norm (id_pago_txt, fecha_txt, cbu_txt, valor_txt)
         SELECT
-            CASE WHEN NULLIF(LTRIM(RTRIM(c4)),'') IS NOT NULL THEN c1 ELSE NULL END,
-            CASE WHEN NULLIF(LTRIM(RTRIM(c4)),'') IS NOT NULL THEN c2 ELSE c1 END,
-            CASE WHEN NULLIF(LTRIM(RTRIM(c4)),'') IS NOT NULL THEN c3 ELSE c2 END,
-            CASE WHEN NULLIF(LTRIM(RTRIM(c4)),'') IS NOT NULL THEN c4 ELSE c3 END
-        FROM #raw;
+            LTRIM(RTRIM(c1)),
+            LTRIM(RTRIM(c2)),
+            LTRIM(RTRIM(c3)),
+            LTRIM(RTRIM(c4))
+        FROM #raw
+        WHERE NULLIF(LTRIM(RTRIM(c4)), '') IS NOT NULL;
 
         DECLARE @FilasNorm INT = (SELECT COUNT(*) FROM #norm);
         IF @Verbose = 1
@@ -1807,15 +2412,12 @@ BEGIN
         END
 
         /* =============================== 3) Parseo -> #pagos =============================== */
-        /* =============================== 3) Parseo -> #pagos =============================== */
         ;WITH pre AS (
             SELECT
                 n.id_norm,
                 n.fecha_txt,
-                /* limpio CBU de separadores comunes y espacios/tab/NBSP */
                 REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(UPPER(LTRIM(RTRIM(n.cbu_txt))),
                     NCHAR(160),N''), CHAR(9), N''), ' ', ''), '.', ''), '-', '') AS cbu_clean,
-                /* normalizo texto de valor: saco moneda y quotes, preservo paréntesis p/negativos */
                 UPPER(LTRIM(RTRIM(
                     REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(n.valor_txt,
                         NCHAR(160), N' '), CHAR(9), N' '), 'AR$', ''), 'ARS', ''), 'U$S', ''), '$',''), '"','')
@@ -1823,18 +2425,15 @@ BEGIN
             FROM #norm n
         ),
         negfix AS (
-            /* detecto paréntesis: “(123,45)” => negativo */
             SELECT
                 id_norm,
                 fecha_txt,
                 cbu_clean,
                 CASE WHEN v0 LIKE '(%' AND v0 LIKE '%)' THEN 1 ELSE 0 END AS es_neg,
-                /* quito paréntesis si los hubiera */
                 REPLACE(REPLACE(v0,'(','') ,')','') AS v1
             FROM pre
         ),
         sincar AS (
-            /* quito espacios */
             SELECT
                 id_norm,
                 fecha_txt,
@@ -1844,23 +2443,18 @@ BEGIN
             FROM negfix
         ),
         cands AS (
-            /* genero 3 candidatos de interpretación */
             SELECT
                 id_norm,
                 fecha_txt,
                 cbu_clean,
                 es_neg,
                 v2,
-                -- A) coma decimal: 1.234,56 => 1234.56
                 REPLACE(REPLACE(v2, '.', ''), ',', '.') AS cand_coma,
-                -- B) punto decimal: 12,345.67 => 12345.67
                 REPLACE(REPLACE(v2, ',', ''), '.', '.') AS cand_punto,
-                -- C) sin separadores: 1.234.567 => 1234567
                 REPLACE(REPLACE(v2, '.', ''), ',', '') AS cand_sin
             FROM sincar
         ),
         decpos AS (
-            /* posición del punto en cada candidato para validar “dos decimales” */
             SELECT
                 id_norm, fecha_txt, cbu_clean, es_neg, v2, cand_coma, cand_punto, cand_sin,
                 CASE WHEN CHARINDEX('.', cand_coma)  > 0
@@ -1872,17 +2466,12 @@ BEGIN
         parsed AS (
             SELECT
                 n.id_norm,
-                /* fechas: dd/mm/yyyy, yyyy-mm-dd, genérico */
                 COALESCE(
                     TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(n.fecha_txt)),''), 103),
                     TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(n.fecha_txt)),''), 120),
                     TRY_CONVERT(date, NULLIF(LTRIM(RTRIM(n.fecha_txt)),''))      
                 ) AS fecha,
-
-                /* CBU pad-left a 22 */
                 CAST(RIGHT(CONCAT(REPLICATE('0',22), n.cbu_clean), 22) AS CHAR(22)) AS CBU_CVU,
-
-                /* monto: priorizo el candidato cuyo decimal tiene exactamente 2 dígitos */
                 COALESCE(
                     CASE WHEN n.dec2_punto = 2
                          THEN TRY_CONVERT(DECIMAL(12,2), CASE WHEN n.es_neg=1 THEN '-' + n.cand_punto ELSE n.cand_punto END)
@@ -1890,10 +2479,8 @@ BEGIN
                     CASE WHEN n.dec2_coma = 2
                          THEN TRY_CONVERT(DECIMAL(12,2), CASE WHEN n.es_neg=1 THEN '-' + n.cand_coma ELSE n.cand_coma END)
                     END,
-                    /* si no hubo match “2 decimales”, intento ambos igual */
                     TRY_CONVERT(DECIMAL(12,2), CASE WHEN n.es_neg=1 THEN '-' + n.cand_punto ELSE n.cand_punto END),
                     TRY_CONVERT(DECIMAL(12,2), CASE WHEN n.es_neg=1 THEN '-' + n.cand_coma  ELSE n.cand_coma  END),
-                    /* último recurso: entero */
                     TRY_CONVERT(DECIMAL(12,2), CASE WHEN n.es_neg=1 THEN '-' + n.cand_sin   ELSE n.cand_sin   END)
                 ) AS valor
             FROM decpos n
@@ -1915,7 +2502,7 @@ BEGIN
                  N'Parseo de pagos', @DetPagos, @RutaArchivo, @LogPath;
         END
 
-        /* Errores de parseo 1:1 por id_norm (evita que “desaparezcan” filas) */
+        /* Errores de parseo */
         INSERT INTO #errores (motivo, fecha_txt, cbu_txt, valor_txt)
         SELECT N'Fila inválida (fecha/valor/CBU)', n.fecha_txt, n.cbu_txt, n.valor_txt
         FROM #norm n
@@ -1924,19 +2511,24 @@ BEGIN
 
         DECLARE @ErroresParseo INT = (SELECT COUNT(*) FROM #errores);
 
-        /* =============================== 4) Enriquecer (UF/Consorcio/Expensa) =============================== */
+        /* =============================== 4) Enriquecer =============================== */
         ;WITH pagos_enriq AS
         (
             SELECT
                 p.fecha,
-                p.valor                AS monto,
+                p.valor AS monto,
                 p.CBU_CVU,
                 uf.idUnidadFuncional,
                 uf.idConsorcio
             FROM #pagos p
             LEFT JOIN app.Tbl_UnidadFuncional uf
-                   ON uf.CBU_CVU = p.CBU_CVU
-        )
+           ON RIGHT(
+                 CONCAT(REPLICATE('0',22),
+                        REPLACE(REPLACE(REPLACE(REPLACE(UPPER(LTRIM(RTRIM(uf.CBU_CVU))),
+                                NCHAR(160),N''), CHAR(9), N''), ' ', ''), '-', '')
+                 ), 22
+              ) = p.CBU_CVU
+)
         SELECT
             pe.*,
             e.nroExpensa
@@ -1953,7 +2545,7 @@ BEGIN
             ORDER BY e.fechaGeneracion DESC, e.nroExpensa DESC
         ) e;
 
-        /* Registrar faltantes de mapeo (UF/consorcio/expensa) */
+        /* Registrar errores de mapeo */
         INSERT INTO #errores (motivo, fecha_txt, cbu_txt, valor_txt)
         SELECT
             CASE 
@@ -1988,9 +2580,7 @@ BEGIN
                   AND ec.nroExpensa        = p.nroExpensa
           );
 
-        /* Filas válidas (con mapeo completo Y EstadoCuenta existente) */
-        IF OBJECT_ID('tempdb..#ok') IS NOT NULL DROP TABLE #ok;
-
+        /* Filas válidas */
         SELECT DISTINCT
             p.fecha,
             p.monto,
@@ -2029,7 +2619,7 @@ BEGIN
                  N'Filas listas para inserción', @DetOkMsg, @RutaArchivo, @LogPath;
         END
 
-        /* =============================== 4.b) Pagos no asociados (idempotente) =============================== */
+        /* =============================== 4.b) Pagos no asociados =============================== */
         IF OBJECT_ID('importacion.Tbl_Pago_No_Asociado', 'U') IS NOT NULL
         BEGIN
             INSERT INTO importacion.Tbl_Pago_No_Asociado
@@ -2055,7 +2645,7 @@ BEGIN
             END
         END
 
-        /* =============================== 5) INSERTAR PAGOS (IDEMPOTENTE) =============================== */
+        /* =============================== 5) INSERTAR PAGOS =============================== */
         IF OBJECT_ID('tempdb..#merge_out_pagos') IS NOT NULL DROP TABLE #merge_out_pagos;
         CREATE TABLE #merge_out_pagos (accion NVARCHAR(10));
 
@@ -2108,7 +2698,7 @@ BEGIN
                 N'; errores_match=', @ErroresMatch,
                 N'; pagos_no_asociados=', @PagosNoAsociados,
                 N'; pagos_listos=', @FilasOK,
-                N'; pagos_ins_total(tras merge)=', @PagosInsertados
+                N'; pagos_ins_total=', @PagosInsertados
             );
 
         IF @Verbose = 1
@@ -2141,8 +2731,6 @@ BEGIN
     END CATCH
 END
 GO
-
-
 -- //////////////////////////////////////////////////////////////////////
 CREATE OR ALTER PROCEDURE app.Sp_CargarGastosExtraordinariosIniciales
     @Verbose BIT = 0
@@ -2299,105 +2887,6 @@ BEGIN
 END
 GO
 -- //////////////////////////////////////////////////////////////////////
-CREATE OR ALTER PROCEDURE app.Sp_GenerarEstadoCuentaDesdeExpensas
-    @Anio    INT,
-    @LogPath NVARCHAR(4000) = NULL,
-    @Verbose BIT = 1
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @Procedimiento SYSNAME = N'app.Sp_GenerarEstadoCuentaDesdeExpensas';
-
-    BEGIN TRY
-        IF @Verbose = 1
-            EXEC reportes.Sp_LogReporte
-                 @Procedimiento, 'INFO',
-                 N'Inicio generación EstadosCuenta', NULL, NULL, @LogPath;
-
-        /* 1) Expensas del año indicado */
-        IF OBJECT_ID('tempdb..#exp_anio') IS NOT NULL DROP TABLE #exp_anio;
-
-        SELECT
-            e.idConsorcio,
-            e.nroExpensa,
-            e.fechaGeneracion
-        INTO #exp_anio
-        FROM app.Tbl_Expensa e
-        WHERE YEAR(e.fechaGeneracion) = @Anio;
-
-        DECLARE @ExpensasAnio INT = (SELECT COUNT(*) FROM #exp_anio);
-
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @DetExp NVARCHAR(4000) =
-                N'expensas_anio=' + CONVERT(NVARCHAR(20), @ExpensasAnio);
-            EXEC reportes.Sp_LogReporte
-                 @Procedimiento, 'INFO',
-                 N'Expensas a procesar', @DetExp, NULL, @LogPath;
-        END
-
-        /* 2) Crear EstadosCuenta para cada UF de cada expensa (evitando duplicados) */
-        INSERT INTO app.Tbl_EstadoCuenta (nroUnidadFuncional, idConsorcio, nroExpensa)
-        SELECT
-            uf.idUnidadFuncional         AS nroUnidadFuncional,
-            ea.idConsorcio,
-            ea.nroExpensa
-        FROM #exp_anio ea
-        JOIN app.Tbl_UnidadFuncional uf
-          ON uf.idConsorcio = ea.idConsorcio
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM app.Tbl_EstadoCuenta ec
-            WHERE ec.nroUnidadFuncional = uf.idUnidadFuncional
-              AND ec.idConsorcio       = ea.idConsorcio
-              AND ec.nroExpensa        = ea.nroExpensa
-        );
-
-        DECLARE @EstadosCreados INT = @@ROWCOUNT;
-
-        IF @Verbose = 1
-        BEGIN
-            DECLARE @DetEC NVARCHAR(4000) =
-                N'estados_creados=' + CONVERT(NVARCHAR(20), @EstadosCreados);
-            EXEC reportes.Sp_LogReporte
-                 @Procedimiento, 'INFO',
-                 N'EstadosCuenta generados', @DetEC, NULL, @LogPath;
-        END
-
-        /* 3) Fin + resumen */
-        DECLARE @Resumen NVARCHAR(4000) =
-            N'expensas_anio=' + CONVERT(NVARCHAR(20), @ExpensasAnio) +
-            N'; estados_creados=' + CONVERT(NVARCHAR(20), @EstadosCreados);
-
-        IF @Verbose = 1
-            EXEC reportes.Sp_LogReporte
-                 @Procedimiento, 'INFO',
-                 N'Fin OK', @Resumen, NULL, @LogPath;
-
-        SELECT
-            expensas_anio     = @ExpensasAnio,
-            estados_creados   = @EstadosCreados,
-            mensaje           = N'OK';
-    END TRY
-    BEGIN CATCH
-        DECLARE @MsgError NVARCHAR(4000) = ERROR_MESSAGE();
-        DECLARE @DetErr  NVARCHAR(4000) =
-            N'Error en línea ' + CONVERT(NVARCHAR(10), ERROR_LINE());
-
-        EXEC reportes.Sp_LogReporte
-            @Procedimiento = @Procedimiento,
-            @Tipo          = 'ERROR',
-            @Mensaje       = @DetErr,
-            @Detalle       = @MsgError,
-            @RutaArchivo   = NULL,
-            @RutaLog       = @LogPath;
-
-        THROW;
-    END CATCH
-END
-GO
--- //////////////////////////////////////////////////////////////////////
 CREATE OR ALTER PROCEDURE app.Sp_RecalcularMoraEstadosCuenta_Todo
 AS
 BEGIN
@@ -2463,5 +2952,233 @@ BEGIN
             ISNULL(ec.expensasExtraordinarias, 0)
     ) AS calc;
 END;
+GO
+-- //////////////////////////////////////////////////////////////////////
+CREATE OR ALTER PROCEDURE reportes.Sp_ReporteEstadoFinanciero
+    @Anio        INT,
+    @IdConsorcio INT     = NULL,   -- NULL = todos
+    @MesDesde    TINYINT = 1,      -- 1..12
+    @MesHasta    TINYINT = 12,     -- 1..12
+    @LogPath     NVARCHAR(4000) = NULL,
+    @Verbose     BIT = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @Procedimiento SYSNAME = N'reportes.Sp_ReporteEstadoFinanciero';
+
+    IF @MesDesde < 1 OR @MesDesde > 12
+       OR @MesHasta < 1 OR @MesHasta > 12
+       OR @MesDesde > @MesHasta
+    BEGIN
+        RAISERROR(N'Rango de meses inválido.', 16, 1);
+        RETURN;
+    END;
+
+    IF @Verbose = 1
+        EXEC reportes.Sp_LogReporte
+             @Procedimiento, 'INFO',
+             N'Inicio reporte estado financiero',
+             NULL, NULL, @LogPath;
+
+    ;WITH meses AS (
+        SELECT DISTINCT
+            e.idConsorcio,
+            YEAR(e.fechaGeneracion)  AS Anio,
+            MONTH(e.fechaGeneracion) AS Mes
+        FROM app.Tbl_Expensa e
+        WHERE YEAR(e.fechaGeneracion) = @Anio
+          AND MONTH(e.fechaGeneracion) BETWEEN @MesDesde AND @MesHasta
+          AND (@IdConsorcio IS NULL OR e.idConsorcio = @IdConsorcio)
+    ),
+    base AS (
+        SELECT
+            m.idConsorcio,
+            m.Anio,
+            m.Mes,
+            DATEFROMPARTS(m.Anio, m.Mes, 1)                  AS FechaInicio,
+            EOMONTH(DATEFROMPARTS(m.Anio, m.Mes, 1))         AS FechaFin
+        FROM meses m
+    ),
+    ingresos AS (
+        SELECT
+            b.idConsorcio,
+            b.Anio,
+            b.Mes,
+            -- pagos de expensas del MISMO mes
+            SUM(CASE
+                    WHEN e.fechaGeneracion >= b.FechaInicio
+                     AND e.fechaGeneracion <= b.FechaFin
+                    THEN p.monto ELSE 0
+                END) AS IngresosEnTermino,
+            -- pagos de expensas de meses ANTERIORES (saldo deudor)
+            SUM(CASE
+                    WHEN e.fechaGeneracion < b.FechaInicio
+                    THEN p.monto ELSE 0
+                END) AS IngresosAdeudadas,
+            -- pagos de expensas de meses POSTERIORES (adelantadas)
+            SUM(CASE
+                    WHEN e.fechaGeneracion > b.FechaFin
+                    THEN p.monto ELSE 0
+                END) AS IngresosAdelantadas,
+            -- total ingresos del mes (suma de todo)
+            SUM(p.monto) AS IngresosTotal
+        FROM base b
+        LEFT JOIN app.Tbl_Pago p
+          ON p.idConsorcio = b.idConsorcio
+         AND p.fecha BETWEEN b.FechaInicio AND b.FechaFin
+        LEFT JOIN app.Tbl_Expensa e
+          ON e.nroExpensa   = p.nroExpensa
+         AND e.idConsorcio  = p.idConsorcio
+        GROUP BY
+            b.idConsorcio, b.Anio, b.Mes
+    ),
+    egresos AS (
+        SELECT
+            b.idConsorcio,
+            b.Anio,
+            b.Mes,
+            SUM(g.importe) AS EgresosMes
+        FROM base b
+        LEFT JOIN app.Tbl_Gasto g
+          ON g.idConsorcio  = b.idConsorcio
+         AND g.fechaEmision BETWEEN b.FechaInicio AND b.FechaFin
+        GROUP BY
+            b.idConsorcio, b.Anio, b.Mes
+    ),
+    combinado AS (
+        SELECT
+            b.idConsorcio,
+            b.Anio,
+            b.Mes,
+            ISNULL(i.IngresosTotal,       0) AS IngresosTotal,
+            ISNULL(i.IngresosEnTermino,   0) AS IngresosEnTermino,
+            ISNULL(i.IngresosAdeudadas,   0) AS IngresosAdeudadas,
+            ISNULL(i.IngresosAdelantadas, 0) AS IngresosAdelantadas,
+            ISNULL(e.EgresosMes,          0) AS EgresosMes
+        FROM base b
+        LEFT JOIN ingresos i
+               ON i.idConsorcio = b.idConsorcio
+              AND i.Anio        = b.Anio
+              AND i.Mes         = b.Mes
+        LEFT JOIN egresos e
+               ON e.idConsorcio = b.idConsorcio
+              AND e.Anio        = b.Anio
+              AND e.Mes         = b.Mes
+    ),
+    fin AS (
+        SELECT
+            c.idConsorcio,
+            cs.nombre AS nombreConsorcio,
+            c.Anio,
+            c.Mes,
+            c.IngresosTotal,
+            c.IngresosEnTermino,
+            c.IngresosAdeudadas,
+            c.IngresosAdelantadas,
+            c.EgresosMes,
+            -- saldo acumulado = Σ (ingresos - egresos) hasta ese mes
+            SUM(c.IngresosTotal - c.EgresosMes) OVER (
+                PARTITION BY c.idConsorcio
+                ORDER BY     c.Anio, c.Mes
+            ) AS SaldoAcumulado
+        FROM combinado c
+        JOIN app.Tbl_Consorcio cs
+          ON cs.idConsorcio = c.idConsorcio
+    )
+    SELECT
+        f.idConsorcio,
+        f.nombreConsorcio,
+        f.Anio,
+        f.Mes,
+        -- saldo anterior = saldo acumulado del mes previo
+        LAG(f.SaldoAcumulado, 1, 0) OVER (
+            PARTITION BY f.idConsorcio
+            ORDER BY     f.Anio, f.Mes
+        ) AS SaldoAnterior,
+        f.IngresosEnTermino,
+        f.IngresosAdeudadas,
+        f.IngresosAdelantadas,
+        f.EgresosMes                  AS EgresosGastosMes,
+        f.SaldoAcumulado              AS SaldoAlCierre
+    FROM fin f
+    ORDER BY
+        f.idConsorcio, f.Anio, f.Mes;
+
+    IF @Verbose = 1
+        EXEC reportes.Sp_LogReporte
+             @Procedimiento, 'INFO',
+             N'Fin OK reporte estado financiero',
+             NULL, NULL, @LogPath;
+END
+GO
+-- //////////////////////////////////////////////////////////////////////
+CREATE OR ALTER PROCEDURE reportes.Sp_ReporteEstadoCuentasProrrateo
+    @IdConsorcio INT     = NULL,
+    @Anio        INT     = NULL,
+    @Mes         TINYINT = NULL,
+    @NroExpensa  INT     = NULL,
+    @LogPath     NVARCHAR(4000) = NULL,
+    @Verbose     BIT     = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @Procedimiento SYSNAME = N'reportes.Sp_ReporteEstadoCuentasProrrateo';
+
+    IF @Verbose = 1
+        EXEC reportes.Sp_LogReporte
+             @Procedimiento, 'INFO',
+             N'Inicio reporte estado de cuentas',
+             NULL, NULL, @LogPath;
+
+    SELECT
+        c.idConsorcio,
+        c.nombre                 AS Consorcio,
+        e.nroExpensa,
+        e.fechaGeneracion,
+        ec.nroUnidadFuncional    AS Uf,
+        uf.porcentaje            AS Porcentaje,
+        uf.piso                  AS Piso,
+        uf.departamento          AS Depto,
+        CASE WHEN ISNULL(uf.metrosCochera, 0) > 0 THEN 1 ELSE 0 END AS Cocheras,
+        CASE WHEN ISNULL(uf.metrosBaulera, 0) > 0 THEN 1 ELSE 0 END AS Bauleras,
+        COALESCE(
+            p.apellido + ', ' + p.nombre,
+            p.nombre,
+            p.apellido
+        )                        AS Propietario,
+        ec.saldoAnterior         AS SaldoAnteriorAbonado,
+        ec.pagoRecibido          AS PagosRecibidos,
+        ec.deuda                 AS Deuda,
+        ec.interesMora           AS InteresMora,
+        ec.expensasOrdinarias    AS ExpensasOrdinarias,
+        ec.expensasExtraordinarias AS ExpensasExtraordinarias,
+        ec.totalAPagar           AS TotalAPagar
+    FROM app.Tbl_EstadoCuenta ec
+    JOIN app.Tbl_UnidadFuncional uf
+      ON uf.idUnidadFuncional = ec.nroUnidadFuncional
+    JOIN app.Tbl_Consorcio c
+      ON c.idConsorcio = ec.idConsorcio
+    JOIN app.Tbl_Expensa e
+      ON e.nroExpensa  = ec.nroExpensa
+     AND e.idConsorcio = ec.idConsorcio
+    LEFT JOIN app.Tbl_Persona p
+      ON p.CBU_CVU = uf.CBU_CVU
+    WHERE (@IdConsorcio IS NULL OR c.idConsorcio = @IdConsorcio)
+      AND (@NroExpensa IS NULL OR e.nroExpensa = @NroExpensa)
+      AND (@Anio IS NULL OR YEAR(e.fechaGeneracion) = @Anio)
+      AND (@Mes  IS NULL OR MONTH(e.fechaGeneracion) = @Mes)
+    ORDER BY
+        c.idConsorcio,
+        e.fechaGeneracion,
+        ec.nroUnidadFuncional;
+
+    IF @Verbose = 1
+        EXEC reportes.Sp_LogReporte
+             @Procedimiento, 'INFO',
+             N'Fin OK reporte estado de cuentas',
+             NULL, NULL, @LogPath;
+END
 GO
 -- //////////////////////////////////////////////////////////////////////

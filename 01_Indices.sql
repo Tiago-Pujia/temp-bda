@@ -26,6 +26,12 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IDX_ESTADO_CUENTA_DEUDA' 
     INCLUDE (deuda, interesMora, totalAPagar, fecha);
 GO
 
+/** Tbl_EstadoCuenta -> idConsorcio, nroUnidadFuncional, nroExpensa **/
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_EC_ConsorcioUFExpensa' AND object_id = OBJECT_ID('app.Tbl_EstadoCuenta'))
+CREATE INDEX IX_EC_ConsorcioUFExpensa
+  ON app.Tbl_EstadoCuenta(idConsorcio, nroUnidadFuncional, nroExpensa);
+GO
+
 /** Tbl_Pago -> nroUnidadFuncional, fecha **/
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IDX_PAGO_UF_FECHA'AND object_id = OBJECT_ID('app.Tbl_Pago'))
     CREATE NONCLUSTERED INDEX IDX_PAGO_UF_FECHA 
@@ -52,6 +58,12 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Gasto_ExpensaConsorcio
     CREATE NONCLUSTERED INDEX IX_Gasto_ExpensaConsorcio
     ON app.Tbl_Gasto (nroExpensa, idConsorcio)
     INCLUDE (importe, tipo);
+GO
+
+/** Tbl_Gasto -> idConsorcio, nroExpensa, tipo **/
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Gasto_ConsorcioExpensaTipo' AND object_id = OBJECT_ID('app.Tbl_Gasto'))
+CREATE INDEX IX_Gasto_ConsorcioExpensaTipo
+  ON app.Tbl_Gasto(idConsorcio, nroExpensa, tipo) INCLUDE(importe);
 GO
 
 /** Tbl_Pago -> fecha, idConsorcio, nroExpensa **/

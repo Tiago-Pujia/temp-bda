@@ -13,10 +13,10 @@ IF COL_LENGTH('app.Tbl_Persona', 'dniCifrado') IS NULL
 BEGIN
     -- Agregar columnas para almacenar datos sensibles encriptados
     ALTER TABLE app.Tbl_Persona
-        ADD dniCifrado      VARBINARY(512) NULL,      -- DNI encriptado
-            emailCifrado    VARBINARY(512) NULL,      -- Email encriptado
-            telefonoCifrado VARBINARY(512) NULL,      -- Teléfono encriptado
-            CBU_CVU_Cifrado VARBINARY(512) NULL;      -- CBU/CVU encriptado
+        ADD dniCifrado      VARBINARY(MAX) NULL,      -- DNI encriptado
+            emailCifrado    VARBINARY(MAX) NULL,      -- Email encriptado
+            telefonoCifrado VARBINARY(MAX) NULL,      -- Teléfono encriptado
+            CBU_CVU_Cifrado VARBINARY(MAX) NULL;      -- CBU/CVU encriptado
 END
 GO
 
@@ -29,7 +29,7 @@ IF COL_LENGTH('app.Tbl_UnidadFuncional', 'CBU_CVU_Cifrado') IS NULL
 BEGIN
     -- Agregar columna para CBU/CVU encriptado en unidades funcionales
     ALTER TABLE app.Tbl_UnidadFuncional
-        ADD CBU_CVU_Cifrado VARBINARY(512) NULL;
+        ADD CBU_CVU_Cifrado VARBINARY(MAX) NULL;
 END
 GO
 
@@ -42,7 +42,7 @@ IF COL_LENGTH('app.Tbl_Pago', 'CBU_CVU_Cifrado') IS NULL
 BEGIN
     -- Agregar columna para CBU/CVU encriptado en pagos
     ALTER TABLE app.Tbl_Pago
-        ADD CBU_CVU_Cifrado VARBINARY(512) NULL;
+        ADD CBU_CVU_Cifrado VARBINARY(MAX) NULL;
 END
 GO
 
@@ -53,15 +53,16 @@ GO
 -- Actualizar registros existentes en Tbl_Persona cifrando datos sensibles
 -- Solo procesa registros donde los datos originales existen y aún no están cifrados
 UPDATE p
-SET dniCifrado       = seguridad.fn_EncriptarTexto(CONVERT(NVARCHAR(50), p.dni)),  -- Convertir DNI numérico a texto y encriptar
-    emailCifrado     = seguridad.fn_EncriptarTexto(p.email),                        -- Encriptar email
-    telefonoCifrado  = seguridad.fn_EncriptarTexto(p.telefono),                     -- Encriptar teléfono
-    CBU_CVU_Cifrado  = seguridad.fn_EncriptarTexto(p.CBU_CVU)                       -- Encriptar CBU/CVU
-FROM app.Tbl_Persona p
-WHERE (p.dniCifrado       IS NULL AND p.dni       IS NOT NULL)   -- Solo si DNI existe y no está cifrado
-   OR (p.emailCifrado     IS NULL AND p.email     IS NOT NULL)   -- Solo si email existe y no está cifrado
-   OR (p.telefonoCifrado  IS NULL AND p.telefono  IS NOT NULL)   -- Solo si teléfono existe y no está cifrado
-   OR (p.CBU_CVU_Cifrado  IS NULL AND p.CBU_CVU   IS NOT NULL);  -- Solo si CBU/CVU existe y no está cifrado
+SET
+  dniCifrado       = CASE WHEN p.dni      IS NOT NULL AND (p.dniCifrado IS NULL OR seguridad.fn_DesencriptarTexto(p.dniCifrado) IS NULL)
+                          THEN seguridad.fn_EncriptarTexto(CONVERT(NVARCHAR(50),  p.dni)) ELSE p.dniCifrado END,
+  emailCifrado     = CASE WHEN p.email    IS NOT NULL AND (p.emailCifrado IS NULL OR seguridad.fn_DesencriptarTexto(p.emailCifrado) IS NULL)
+                          THEN seguridad.fn_EncriptarTexto(p.email) ELSE p.emailCifrado END,
+  telefonoCifrado  = CASE WHEN p.telefono IS NOT NULL AND (p.telefonoCifrado IS NULL OR seguridad.fn_DesencriptarTexto(p.telefonoCifrado) IS NULL)
+                          THEN seguridad.fn_EncriptarTexto(p.telefono) ELSE p.telefonoCifrado END,
+  CBU_CVU_Cifrado  = CASE WHEN p.CBU_CVU  IS NOT NULL AND (p.CBU_CVU_Cifrado IS NULL OR seguridad.fn_DesencriptarTexto(p.CBU_CVU_Cifrado) IS NULL)
+                          THEN seguridad.fn_EncriptarTexto(p.CBU_CVU) ELSE p.CBU_CVU_Cifrado END
+FROM app.Tbl_Persona p;
 GO
 
 -- ============================================================
@@ -70,10 +71,9 @@ GO
 
 -- Actualizar registros existentes en Tbl_UnidadFuncional cifrando CBU/CVU
 UPDATE uf
-SET CBU_CVU_Cifrado = seguridad.fn_EncriptarTexto(uf.CBU_CVU)  -- Encriptar CBU/CVU de unidades funcionales
-FROM app.Tbl_UnidadFuncional uf
-WHERE uf.CBU_CVU_Cifrado IS NULL    -- Solo si no está cifrado
-  AND uf.CBU_CVU IS NOT NULL;       -- Y existe dato original
+SET CBU_CVU_Cifrado = CASE WHEN uf.CBU_CVU IS NOT NULL AND (uf.CBU_CVU_Cifrado IS NULL OR seguridad.fn_DesencriptarTexto(uf.CBU_CVU_Cifrado) IS NULL)
+                           THEN seguridad.fn_EncriptarTexto(uf.CBU_CVU) ELSE uf.CBU_CVU_Cifrado END
+FROM app.Tbl_UnidadFuncional uf;
 GO
 
 -- ============================================================
@@ -82,8 +82,18 @@ GO
 
 -- Actualizar registros existentes en Tbl_Pago cifrando CBU/CVU
 UPDATE pa
-SET CBU_CVU_Cifrado = seguridad.fn_EncriptarTexto(pa.CBU_CVU)  -- Encriptar CBU/CVU de pagos
-FROM app.Tbl_Pago pa
-WHERE pa.CBU_CVU_Cifrado IS NULL    -- Solo si no está cifrado
-  AND pa.CBU_CVU IS NOT NULL;       -- Y existe dato original
+SET CBU_CVU_Cifrado = CASE WHEN pa.CBU_CVU IS NOT NULL AND (pa.CBU_CVU_Cifrado IS NULL OR seguridad.fn_DesencriptarTexto(pa.CBU_CVU_Cifrado) IS NULL)
+                           THEN seguridad.fn_EncriptarTexto(pa.CBU_CVU) ELSE pa.CBU_CVU_Cifrado END
+FROM app.Tbl_Pago pa;
+GO
+
+CREATE OR ALTER VIEW app.Vw_PersonaSegura AS
+SELECT
+    p.idPersona,
+    p.nombre,
+    p.apellido,
+    ISNULL(seguridad.fn_DesencriptarTexto(p.dniCifrado),      CONVERT(NVARCHAR(50),  p.dni))      AS dni,
+    ISNULL(seguridad.fn_DesencriptarTexto(p.emailCifrado),    p.email)                              AS email,
+    ISNULL(seguridad.fn_DesencriptarTexto(p.telefonoCifrado), p.telefono)                           AS telefono
+FROM app.Tbl_Persona p;
 GO

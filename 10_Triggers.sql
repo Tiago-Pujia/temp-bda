@@ -57,89 +57,62 @@ ON app.Tbl_Pago
 AFTER INSERT, UPDATE, DELETE
 AS
 BEGIN
-    SET NOCOUNT ON;
+  SET NOCOUNT ON;
 
-    /* 1) Estados de cuenta afectados por inserciones / updates / deletes */
-    ;WITH afectados AS (
-        SELECT idEstadoCuenta
-        FROM inserted
-        WHERE idEstadoCuenta IS NOT NULL
-        UNION
-        SELECT idEstadoCuenta
-        FROM deleted
-        WHERE idEstadoCuenta IS NOT NULL
-    ),
-    agg_pagos AS (
-        SELECT
-            p.idEstadoCuenta,
-            SUM(p.monto) AS montoPagado,
-            MAX(p.fecha) AS fechaUltimoPago
-        FROM app.Tbl_Pago p
-        JOIN afectados a
-          ON a.idEstadoCuenta = p.idEstadoCuenta
-        GROUP BY p.idEstadoCuenta
-    )
-    UPDATE ec
-       SET
-           -- 1) Total pagado
-           ec.pagoRecibido = ISNULL(ap.montoPagado, 0),
+  DECLARE @Hoy DATE = CAST(GETDATE() AS DATE);
 
-           -- 2) Deuda = baseMes - pagos (no negativa)
-           ec.deuda =
-               CASE
-                   WHEN calc.baseMes <= ISNULL(ap.montoPagado, 0) THEN 0
-                   ELSE calc.baseMes - ISNULL(ap.montoPagado, 0)
-               END,
-
-           -- 3) Interés por mora
-           ec.interesMora =
-               CASE
-                   -- Si ya cubrió todo el mes o no hay pagos, no calculo mora
-                   WHEN calc.baseMes <= ISNULL(ap.montoPagado, 0)
-                        OR ap.montoPagado IS NULL THEN 0
-
-                   -- Pagó todo pero fuera de término -> podría ajustarse si quisieras
-                   WHEN ap.fechaUltimoPago <= ex.fechaVto1 THEN 0
-
-                   WHEN ap.fechaUltimoPago > ex.fechaVto1
-                        AND (ex.fechaVto2 IS NULL OR ap.fechaUltimoPago <= ex.fechaVto2)
-                        THEN ROUND(0.02 * (calc.baseMes - ISNULL(ap.montoPagado, 0)), 2)
-
-                   WHEN ex.fechaVto2 IS NOT NULL AND ap.fechaUltimoPago > ex.fechaVto2
-                        THEN ROUND(0.05 * (calc.baseMes - ISNULL(ap.montoPagado, 0)), 2)
-
-                   ELSE 0
-               END,
-
-           -- 4) Total a pagar = deuda + interés
-           ec.totalAPagar =
-               CASE
-                   WHEN calc.baseMes <= ISNULL(ap.montoPagado, 0) THEN 0
-                   ELSE
-                       (calc.baseMes - ISNULL(ap.montoPagado, 0))
-                       +
-                       CASE
-                           WHEN ap.fechaUltimoPago <= ex.fechaVto1 THEN 0
-                           WHEN ap.fechaUltimoPago > ex.fechaVto1
-                                AND (ex.fechaVto2 IS NULL OR ap.fechaUltimoPago <= ex.fechaVto2)
-                                THEN ROUND(0.02 * (calc.baseMes - ISNULL(ap.montoPagado, 0)), 2)
-                           WHEN ex.fechaVto2 IS NOT NULL AND ap.fechaUltimoPago > ex.fechaVto2
-                                THEN ROUND(0.05 * (calc.baseMes - ISNULL(ap.montoPagado, 0)), 2)
-                           ELSE 0
-                       END
-               END
-    FROM app.Tbl_EstadoCuenta ec
-    JOIN afectados a
-      ON a.idEstadoCuenta = ec.idEstadoCuenta
-    LEFT JOIN agg_pagos ap
-      ON ap.idEstadoCuenta = ec.idEstadoCuenta
-    JOIN app.Tbl_Expensa ex
-      ON ex.idConsorcio = ec.idConsorcio
-     AND ex.nroExpensa  = ec.nroExpensa
-    CROSS APPLY (
-        SELECT baseMes =
-            ISNULL(ec.expensasOrdinarias, 0) +
-            ISNULL(ec.expensasExtraordinarias, 0)
-    ) AS calc;
-END;
+  ;WITH afectados AS (
+      SELECT idEstadoCuenta FROM inserted WHERE idEstadoCuenta IS NOT NULL
+      UNION
+      SELECT idEstadoCuenta FROM deleted  WHERE idEstadoCuenta IS NOT NULL
+  ),
+  agg_pagos AS (
+      SELECT p.idEstadoCuenta,
+             SUM(p.monto) AS montoPagado,
+             MAX(p.fecha) AS fechaUltimoPago
+      FROM app.Tbl_Pago p
+      JOIN afectados a ON a.idEstadoCuenta = p.idEstadoCuenta
+      GROUP BY p.idEstadoCuenta
+  )
+  UPDATE ec
+     SET ec.pagoRecibido = ISNULL(ap.montoPagado, 0),
+         ec.deuda = CASE
+                      WHEN calc.baseMes <= ISNULL(ap.montoPagado, 0) THEN 0
+                      ELSE calc.baseMes - ISNULL(ap.montoPagado, 0)
+                    END,
+         ec.interesMora =
+             CASE
+               WHEN (calc.baseMes - ISNULL(ap.montoPagado,0)) <= 0 THEN 0
+               WHEN @Hoy <= ex.fechaVto1 THEN 0
+               WHEN @Hoy > ex.fechaVto1
+                    AND (ex.fechaVto2 IS NULL OR @Hoy <= ex.fechaVto2)
+                    THEN ROUND(0.02 * (calc.baseMes - ISNULL(ap.montoPagado,0)), 2)
+               WHEN ex.fechaVto2 IS NOT NULL AND @Hoy > ex.fechaVto2
+                    THEN ROUND(0.05 * (calc.baseMes - ISNULL(ap.montoPagado,0)), 2)
+               ELSE 0
+             END,
+         ec.totalAPagar =
+             CASE
+               WHEN (calc.baseMes - ISNULL(ap.montoPagado,0)) <= 0 THEN 0
+               ELSE (calc.baseMes - ISNULL(ap.montoPagado,0)) +
+                    CASE
+                      WHEN @Hoy <= ex.fechaVto1 THEN 0
+                      WHEN @Hoy > ex.fechaVto1
+                           AND (ex.fechaVto2 IS NULL OR @Hoy <= ex.fechaVto2)
+                           THEN ROUND(0.02 * (calc.baseMes - ISNULL(ap.montoPagado,0)), 2)
+                      WHEN ex.fechaVto2 IS NOT NULL AND @Hoy > ex.fechaVto2
+                           THEN ROUND(0.05 * (calc.baseMes - ISNULL(ap.montoPagado,0)), 2)
+                      ELSE 0
+                    END
+             END
+  FROM app.Tbl_EstadoCuenta ec
+  JOIN afectados a  ON a.idEstadoCuenta = ec.idEstadoCuenta
+  LEFT JOIN agg_pagos ap ON ap.idEstadoCuenta = ec.idEstadoCuenta
+  JOIN app.Tbl_Expensa ex ON ex.idConsorcio = ec.idConsorcio AND ex.nroExpensa = ec.nroExpensa
+  CROSS APPLY (SELECT baseMes = ISNULL(ec.expensasOrdinarias,0) + ISNULL(ec.expensasExtraordinarias,0)) AS calc;
+END
 GO
+
+ENABLE TRIGGER app.tr_Tbl_Pago_RecalcularMora ON app.Tbl_Pago;
+
+EXEC app.Sp_RecalcularMoraEstadosCuenta_Todo;  -- @FechaCorte = GETDATE()

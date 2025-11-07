@@ -5,7 +5,7 @@ GO
    TEST 1: REPORTE DE FLUJO DE CAJA SEMANAL
 ========================================================================= */
 EXEC reportes.Sp_FlujoCajaSemanal
-    @FechaInicio = '2025-04-01',
+    @FechaInicio = '2025-02-07',
     @FechaFin = '2025-12-01',
     @IdConsorcio = NULL;
 

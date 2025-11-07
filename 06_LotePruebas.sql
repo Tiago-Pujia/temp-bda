@@ -1,6 +1,11 @@
 USE Com5600G13;
 GO
 
+-- Cargar gastos extraordinarios iniciales (datos de prueba)
+-- Inserta gastos extraordinarios de ejemplo para testing
+EXEC app.Sp_CargarGastosExtraordinariosIniciales @Verbose = 1;
+GO
+
 /* =========================================================
    1. CONSORCIOS DE PRUEBA
    ========================================================= */
@@ -10,47 +15,39 @@ DECLARE @idConsSinBC INT;        -- Consorcio sin baulera ni cochera
 DECLARE @idConsSoloBaulera INT;  -- Consorcio solo baulera
 DECLARE @idConsSoloCochera INT;  -- Consorcio solo cochera
 
--- Consorcio 1: con baulera y cochera
-IF NOT EXISTS (SELECT 1 FROM app.Tbl_Consorcio WHERE nombre = 'CONSORCIO_TEST_1_FULL_BC')
-BEGIN
-    INSERT INTO app.Tbl_Consorcio (nombre, direccion, superficieTotal)
-    VALUES ('CONSORCIO_TEST_1_FULL_BC', 'Altos Saint Just 100', 1000.00);
-END;
-SELECT @idConsFullBC = idConsorcio
-FROM app.Tbl_Consorcio
-WHERE nombre = 'CONSORCIO_TEST_1_FULL_BC';
+DECLARE @src TABLE (
+  nombre          VARCHAR(50) PRIMARY KEY,
+  direccion       VARCHAR(100),
+  superficieTotal DECIMAL(10,2)
+);
 
--- Consorcio 2: sin baulera ni cochera
-IF NOT EXISTS (SELECT 1 FROM app.Tbl_Consorcio WHERE nombre = 'CONSORCIO_TEST_2_SIN_BC')
-BEGIN
-    INSERT INTO app.Tbl_Consorcio (nombre, direccion, superficieTotal)
-    VALUES ('CONSORCIO_TEST_2_SIN_BC', 'Calle Falsa 456', 800.00);
-END;
-SELECT @idConsSinBC = idConsorcio
-FROM app.Tbl_Consorcio
-WHERE nombre = 'CONSORCIO_TEST_2_SIN_BC';
+INSERT INTO @src (nombre, direccion, superficieTotal) VALUES
+ ('CONSORCIO_TEST_1_FULL_BC',    'Altos Saint Just 100', 1000.00),
+ ('CONSORCIO_TEST_2_SIN_BC',     'Calle Falsa 456',       800.00),
+ ('CONSORCIO_TEST_3_SOLO_BAULERA','Pasaje Prueba 789',    600.00),
+ ('CONSORCIO_TEST_4_SOLO_COCHERA','Boulevard Test 101',   900.00);
 
--- Consorcio 3: solo baulera
-IF NOT EXISTS (SELECT 1 FROM app.Tbl_Consorcio WHERE nombre = 'CONSORCIO_TEST_3_SOLO_BAULERA')
-BEGIN
-    INSERT INTO app.Tbl_Consorcio (nombre, direccion, superficieTotal)
-    VALUES ('CONSORCIO_TEST_3_SOLO_BAULERA', 'Pasaje Prueba 789', 600.00);
-END;
-SELECT @idConsSoloBaulera = idConsorcio
-FROM app.Tbl_Consorcio
-WHERE nombre = 'CONSORCIO_TEST_3_SOLO_BAULERA';
+-- 1) Insertar solo los que falten (primera vez)
+INSERT INTO app.Tbl_Consorcio (nombre, direccion, superficieTotal)
+SELECT s.nombre, s.direccion, s.superficieTotal
+FROM @src s
+WHERE NOT EXISTS (
+  SELECT 1 FROM app.Tbl_Consorcio c WHERE c.nombre = s.nombre
+);
 
--- Consorcio 4: solo cochera
-IF NOT EXISTS (SELECT 1 FROM app.Tbl_Consorcio WHERE nombre = 'CONSORCIO_TEST_4_SOLO_COCHERA')
-BEGIN
-    INSERT INTO app.Tbl_Consorcio (nombre, direccion, superficieTotal)
-    VALUES ('CONSORCIO_TEST_4_SOLO_COCHERA', 'Boulevard Test 101', 900.00);
-END;
-SELECT @idConsSoloCochera = idConsorcio
-FROM app.Tbl_Consorcio
-WHERE nombre = 'CONSORCIO_TEST_4_SOLO_COCHERA';
+-- 2) Completar NULLs si quedaron de ejecuciones previas (no pisa valores existentes)
+UPDATE c
+   SET c.direccion       = COALESCE(c.direccion,       s.direccion),
+       c.superficieTotal = COALESCE(c.superficieTotal, s.superficieTotal)
+FROM app.Tbl_Consorcio c
+JOIN @src s ON s.nombre = c.nombre
+WHERE c.direccion IS NULL OR c.superficieTotal IS NULL;
 
-
+-- 3) IDs
+SELECT @idConsFullBC      = idConsorcio FROM app.Tbl_Consorcio WHERE nombre = 'CONSORCIO_TEST_1_FULL_BC';
+SELECT @idConsSinBC       = idConsorcio FROM app.Tbl_Consorcio WHERE nombre = 'CONSORCIO_TEST_2_SIN_BC';
+SELECT @idConsSoloBaulera = idConsorcio FROM app.Tbl_Consorcio WHERE nombre = 'CONSORCIO_TEST_3_SOLO_BAULERA';
+SELECT @idConsSoloCochera = idConsorcio FROM app.Tbl_Consorcio WHERE nombre = 'CONSORCIO_TEST_4_SOLO_COCHERA';
 /* =========================================================
    2. PERSONAS Y RELACI�N CON CONSORCIOS (PROPIETARIOS / INQUILINOS)
    ========================================================= */
@@ -113,40 +110,39 @@ SELECT @idPerDiego = idPersona FROM app.Tbl_Persona WHERE dni = 10000006;
 -- Relaci�n UFPersona (a nivel consorcio)
 IF NOT EXISTS (SELECT 1 FROM app.Tbl_UFPersona WHERE idPersona = @idPerJose)
 BEGIN
-    INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino, fechaInicio, fechaFin)
-    VALUES (@idPerJose, @idConsFullBC, 0, '2025-01-01', NULL);
+    INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino)
+    VALUES (@idPerJose, @idConsFullBC, 0);
 END;
 
 IF NOT EXISTS (SELECT 1 FROM app.Tbl_UFPersona WHERE idPersona = @idPerMaria)
 BEGIN
-    INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino, fechaInicio, fechaFin)
-    VALUES (@idPerMaria, @idConsSinBC, 0, '2025-01-01', NULL);
+    INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino)
+    VALUES (@idPerMaria, @idConsSinBC, 0);
 END;
 
 IF NOT EXISTS (SELECT 1 FROM app.Tbl_UFPersona WHERE idPersona = @idPerCarlos)
 BEGIN
-    INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino, fechaInicio, fechaFin)
-    VALUES (@idPerCarlos, @idConsSoloBaulera, 0, '2025-01-01', NULL);
+    INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino)
+    VALUES (@idPerCarlos, @idConsSoloBaulera, 0);
 END;
 
 IF NOT EXISTS (SELECT 1 FROM app.Tbl_UFPersona WHERE idPersona = @idPerAna)
 BEGIN
-    INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino, fechaInicio, fechaFin)
-    VALUES (@idPerAna, @idConsSoloCochera, 0, '2025-01-01', NULL);
+    INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino)
+    VALUES (@idPerAna, @idConsSoloCochera, 0);
 END;
 
 IF NOT EXISTS (SELECT 1 FROM app.Tbl_UFPersona WHERE idPersona = @idPerLucia)
 BEGIN
-    INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino, fechaInicio, fechaFin)
-    VALUES (@idPerLucia, @idConsFullBC, 1, '2025-02-01', NULL);
+    INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino)
+    VALUES (@idPerLucia, @idConsFullBC, 1);
 END;
 
 IF NOT EXISTS (SELECT 1 FROM app.Tbl_UFPersona WHERE idPersona = @idPerDiego)
 BEGIN
-    INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino, fechaInicio, fechaFin)
-    VALUES (@idPerDiego, @idConsSinBC, 1, '2025-02-01', NULL);
+    INSERT INTO app.Tbl_UFPersona (idPersona, idConsorcio, esInquilino)
+    VALUES (@idPerDiego, @idConsSinBC, 1);
 END;
-
 
 /* =========================================================
    3. UNIDADES FUNCIONALES (10 por consorcio)
@@ -488,24 +484,141 @@ END;
 SELECT @idGasto = idGasto
 FROM app.Tbl_Gasto
 WHERE idConsorcio = @idConsFullBC AND nroExpensa = @ExpFeb2025_C1
-  AND descripcion = 'Servicio de limpieza tercerizado - Febrero 2025';
+  AND descripcion = 'Mantenimiento cuenta bancaria - Febrero 2025';
 
 IF @idGasto IS NULL
 BEGIN
     INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
     VALUES (@ExpFeb2025_C1, @idConsFullBC, 'Ordinario',
-            'Servicio de limpieza tercerizado - Febrero 2025', '2025-02-03', 95000.00);
+            'Mantenimiento cuenta bancaria - Febrero 2025', '2025-02-05', 1500.00);
     SET @idGasto = SCOPE_IDENTITY();
 END;
 
 IF NOT EXISTS (SELECT 1 FROM app.Tbl_Gasto_Ordinario WHERE idGasto = @idGasto)
 BEGIN
     INSERT INTO app.Tbl_Gasto_Ordinario (idGasto, nombreProveedor, categoria, nroFactura)
-    VALUES (@idGasto, 'CleanCorp S.A.', 'Limpieza - Empresa', 'FAC-LIMP-FE-2025-0001');
+    VALUES (@idGasto, 'Banco Prueba S.A.', 'Mantenimiento Cuenta', 'FAC-BCO-FE-2025-0001');
 END;
 
--- (Pod�s agregar m�s gastos de febrero si quer�s m�s volumen, misma l�gica que enero)
+-- Honorarios administración - Febrero
+SELECT @idGasto = idGasto
+FROM app.Tbl_Gasto
+WHERE idConsorcio = @idConsFullBC AND nroExpensa = @ExpFeb2025_C1
+  AND descripcion = 'Honorarios administración - Febrero 2025';
 
+IF @idGasto IS NULL
+BEGIN
+    INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
+    VALUES (@ExpFeb2025_C1, @idConsFullBC, 'Ordinario',
+            'Honorarios administración - Febrero 2025', '2025-02-04', 60000.00);
+    SET @idGasto = SCOPE_IDENTITY();
+END;
+
+IF NOT EXISTS (SELECT 1 FROM app.Tbl_Gasto_Ordinario WHERE idGasto = @idGasto)
+BEGIN
+    INSERT INTO app.Tbl_Gasto_Ordinario (idGasto, nombreProveedor, categoria, nroFactura)
+    VALUES (@idGasto, 'Administración Altos SJ', 'Honorarios', 'FAC-ADM-FE-2025-0001');
+END;
+
+-- Seguros - Febrero
+SELECT @idGasto = idGasto
+FROM app.Tbl_Gasto
+WHERE idConsorcio = @idConsFullBC AND nroExpensa = @ExpFeb2025_C1
+  AND descripcion = 'Seguro integral consorcio - Febrero 2025';
+
+IF @idGasto IS NULL
+BEGIN
+    INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
+    VALUES (@ExpFeb2025_C1, @idConsFullBC, 'Ordinario',
+            'Seguro integral consorcio - Febrero 2025', '2025-02-05', 30000.00);
+    SET @idGasto = SCOPE_IDENTITY();
+END;
+
+IF NOT EXISTS (SELECT 1 FROM app.Tbl_Gasto_Ordinario WHERE idGasto = @idGasto)
+BEGIN
+    INSERT INTO app.Tbl_Gasto_Ordinario (idGasto, nombreProveedor, categoria, nroFactura)
+    VALUES (@idGasto, 'Seguros Unidos S.A.', 'Seguros', 'FAC-SEG-FE-2025-0001');
+END;
+
+-- Gastos generales - Fumigación - Febrero
+SELECT @idGasto = idGasto
+FROM app.Tbl_Gasto
+WHERE idConsorcio = @idConsFullBC AND nroExpensa = @ExpFeb2025_C1
+  AND descripcion = 'Fumigación mensual - Febrero 2025';
+
+IF @idGasto IS NULL
+BEGIN
+    INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
+    VALUES (@ExpFeb2025_C1, @idConsFullBC, 'Ordinario',
+            'Fumigación mensual - Febrero 2025', '2025-02-06', 10000.00);
+    SET @idGasto = SCOPE_IDENTITY();
+END;
+
+IF NOT EXISTS (SELECT 1 FROM app.Tbl_Gasto_Ordinario WHERE idGasto = @idGasto)
+BEGIN
+    INSERT INTO app.Tbl_Gasto_Ordinario (idGasto, nombreProveedor, categoria, nroFactura)
+    VALUES (@idGasto, 'FumiControl S.R.L.', 'Gastos Generales', 'FAC-FUM-FE-2025-0001');
+END;
+
+-- Servicios públicos: Luz - Febrero
+SELECT @idGasto = idGasto
+FROM app.Tbl_Gasto
+WHERE idConsorcio = @idConsFullBC AND nroExpensa = @ExpFeb2025_C1
+  AND descripcion = 'Servicio de Luz - Febrero 2025';
+
+IF @idGasto IS NULL
+BEGIN
+    INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
+    VALUES (@ExpFeb2025_C1, @idConsFullBC, 'Ordinario',
+            'Servicio de Luz - Febrero 2025', '2025-02-10', 28000.00);
+    SET @idGasto = SCOPE_IDENTITY();
+END;
+
+IF NOT EXISTS (SELECT 1 FROM app.Tbl_Gasto_Ordinario WHERE idGasto = @idGasto)
+BEGIN
+    INSERT INTO app.Tbl_Gasto_Ordinario (idGasto, nombreProveedor, categoria, nroFactura)
+    VALUES (@idGasto, 'Edesur', 'Servicios Públicos - Luz', 'FAC-LUZ-FE-2025-0001');
+END;
+
+-- Agua - Febrero
+SELECT @idGasto = idGasto
+FROM app.Tbl_Gasto
+WHERE idConsorcio = @idConsFullBC AND nroExpensa = @ExpFeb2025_C1
+  AND descripcion = 'Servicio de Agua - Febrero 2025';
+
+IF @idGasto IS NULL
+BEGIN
+    INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
+    VALUES (@ExpFeb2025_C1, @idConsFullBC, 'Ordinario',
+            'Servicio de Agua - Febrero 2025', '2025-02-11', 22000.00);
+    SET @idGasto = SCOPE_IDENTITY();
+END;
+
+IF NOT EXISTS (SELECT 1 FROM app.Tbl_Gasto_Ordinario WHERE idGasto = @idGasto)
+BEGIN
+    INSERT INTO app.Tbl_Gasto_Ordinario (idGasto, nombreProveedor, categoria, nroFactura)
+    VALUES (@idGasto, 'AySA', 'Servicios Públicos - Agua', 'FAC-AGUA-FE-2025-0001');
+END;
+
+-- Internet - Febrero
+SELECT @idGasto = idGasto
+FROM app.Tbl_Gasto
+WHERE idConsorcio = @idConsFullBC AND nroExpensa = @ExpFeb2025_C1
+  AND descripcion = 'Servicio de Internet - Febrero 2025';
+
+IF @idGasto IS NULL
+BEGIN
+    INSERT INTO app.Tbl_Gasto (nroExpensa, idConsorcio, tipo, descripcion, fechaEmision, importe)
+    VALUES (@ExpFeb2025_C1, @idConsFullBC, 'Ordinario',
+            'Servicio de Internet - Febrero 2025', '2025-02-12', 15000.00);
+    SET @idGasto = SCOPE_IDENTITY();
+END;
+
+IF NOT EXISTS (SELECT 1 FROM app.Tbl_Gasto_Ordinario WHERE idGasto = @idGasto)
+BEGIN
+    INSERT INTO app.Tbl_Gasto_Ordinario (idGasto, nombreProveedor, categoria, nroFactura)
+    VALUES (@idGasto, 'FibraMax', 'Servicios Públicos - Internet', 'FAC-INT-FE-2025-0001');
+END;
 
 -- ========== MARZO 2025: GASTOS ORDINARIOS + EXTRAORDINARIOS ==========
 

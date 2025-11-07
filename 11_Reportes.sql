@@ -343,9 +343,11 @@ BEGIN
     SET NOCOUNT ON;
     SET @FechaCorte = CONVERT(date, ISNULL(@FechaCorte, GETDATE()));
 
-    /* Propietarios activos por consorcio (si manejás vigencias, descomentar filtros de fecha) */
+    /* Propietarios activos por consorcio (sin idUnidadFuncional en UFPersona) */
     ;WITH ufp_activo AS (
-        SELECT DISTINCT ufp.idPersona, ufp.idConsorcio
+        SELECT DISTINCT
+            ufp.idPersona,
+            ufp.idConsorcio
         FROM app.Tbl_UFPersona ufp
         WHERE ufp.esInquilino = 0
         -- AND (@FechaCorte IS NULL OR (ISNULL(ufp.fechaInicio,'19000101') <= @FechaCorte
@@ -354,21 +356,12 @@ BEGIN
     MorosidadPorPersona AS (
         SELECT
             p.idPersona,
-            p.nombre,
-            p.apellido,
-
-            -- ?? Campos sensibles desencriptados
-            CONVERT(INT, seguridad.fn_DesencriptarTexto(p.dniCifrado)) AS dni,
-            seguridad.fn_DesencriptarTexto(p.emailCifrado)             AS email,
-            seguridad.fn_DesencriptarTexto(p.telefonoCifrado)          AS telefono,
-
-            c.nombre AS consorcio,
+            ec.idConsorcio,
             COUNT(DISTINCT ec.nroExpensa) AS expensasImpagas,
             SUM(ec.deuda)                 AS deudaTotal,
             SUM(ec.interesMora)           AS interesTotal,
             SUM(ec.totalAPagar)           AS totalAPagar,
-            MAX(e.fechaVto1)              AS ultimoVencimiento,
-            DATEDIFF(DAY, MAX(e.fechaVto1), @FechaCorte) AS diasMora
+            MAX(e.fechaVto1)              AS ultimoVencimiento
         FROM app.Tbl_EstadoCuenta ec
         INNER JOIN app.Tbl_Expensa e
                 ON e.nroExpensa  = ec.nroExpensa
@@ -376,42 +369,42 @@ BEGIN
         INNER JOIN app.Tbl_UnidadFuncional uf
                 ON uf.idUnidadFuncional = ec.nroUnidadFuncional
                AND uf.idConsorcio       = ec.idConsorcio
+        /* Match Persona ? UF por CBU/CVU con fallback al desencriptado */
         INNER JOIN app.Tbl_Persona p
-                ON p.CBU_CVU = uf.CBU_CVU              -- persona ? UF por CBU/CVU
+                ON COALESCE(seguridad.fn_DesencriptarTexto(p.CBU_CVU_Cifrado), p.CBU_CVU) = uf.CBU_CVU
+        /* Validamos que sea propietario activo en ese consorcio */
         INNER JOIN ufp_activo u
-                ON u.idPersona   = p.idPersona         -- validar que sea propietario
-               AND u.idConsorcio = ec.idConsorcio      -- y del mismo consorcio
-        INNER JOIN app.Tbl_Consorcio c
-                ON c.idConsorcio = ec.idConsorcio
+                ON u.idPersona   = p.idPersona
+               AND u.idConsorcio = ec.idConsorcio
         WHERE ec.deuda > 0
           AND e.fechaVto1 < @FechaCorte
           AND (@IdConsorcio IS NULL OR ec.idConsorcio = @IdConsorcio)
-        GROUP BY
-            p.idPersona,
-            p.nombre,
-            p.apellido,
-            p.dniCifrado,
-            p.emailCifrado,
-            p.telefonoCifrado,
-            c.nombre
+        GROUP BY p.idPersona, ec.idConsorcio
     )
     SELECT TOP (@TopN)
-        idPersona,
-        CONCAT(apellido, ', ', nombre) AS nombreCompleto,
-        dni, email, telefono,
-        consorcio,
-        deudaTotal, interesTotal, totalAPagar,
-        expensasImpagas,
-        ultimoVencimiento,
-        diasMora,
+        m.idPersona,
+        CONCAT(ps.apellido, ', ', ps.nombre)             AS nombreCompleto,
+        ps.dni,                                          -- ya seguro desde la vista
+        ps.email,
+        ps.telefono,
+        c.nombre                                         AS consorcio,
+        m.deudaTotal, m.interesTotal, m.totalAPagar,
+        m.expensasImpagas,
+        m.ultimoVencimiento,
+        DATEDIFF(DAY, m.ultimoVencimiento, @FechaCorte)  AS diasMora,
         CASE 
-            WHEN diasMora > 180 THEN 'CRITICO'
-            WHEN diasMora >  90 THEN 'ALTO'
-            WHEN diasMora >  30 THEN 'MEDIO'
+            WHEN DATEDIFF(DAY, m.ultimoVencimiento, @FechaCorte) > 180 THEN 'CRITICO'
+            WHEN DATEDIFF(DAY, m.ultimoVencimiento, @FechaCorte) >  90 THEN 'ALTO'
+            WHEN DATEDIFF(DAY, m.ultimoVencimiento, @FechaCorte) >  30 THEN 'MEDIO'
             ELSE 'BAJO'
         END AS nivelMorosidad
-    FROM MorosidadPorPersona
-    ORDER BY totalAPagar DESC, diasMora DESC;
+    FROM MorosidadPorPersona m
+    INNER JOIN app.Vw_PersonaSegura ps
+            ON ps.idPersona = m.idPersona
+    INNER JOIN app.Tbl_Consorcio c
+            ON c.idConsorcio = m.idConsorcio
+    ORDER BY m.totalAPagar DESC,
+             DATEDIFF(DAY, m.ultimoVencimiento, @FechaCorte) DESC;
 END
 GO
 

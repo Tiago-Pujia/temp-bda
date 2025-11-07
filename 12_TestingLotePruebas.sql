@@ -131,27 +131,59 @@ WHERE E.idConsorcio = @idConsFullBC_Test
 SELECT
     UF.piso,
     UF.departamento,
+    UF.porcentaje,
     EC.nroExpensa,
-    EC.saldoAnterior,
+    E.fechaVto1,
+    E.fechaVto2,
+    P.fecha AS fechaPago,
+    EC.expensasOrdinarias + EC.expensasExtraordinarias AS baseCalculo,
     EC.pagoRecibido,
     EC.deuda,
     EC.interesMora,
-    EC.totalAPagar
+    -- Verificar cálculo correcto
+    CASE 
+        WHEN P.fecha IS NULL THEN 'Sin pago'
+        WHEN P.fecha <= E.fechaVto1 THEN '0% (En término)'
+        WHEN P.fecha > E.fechaVto1 AND (E.fechaVto2 IS NULL OR P.fecha <= E.fechaVto2) 
+             THEN '2% (Entre vtos)'
+        WHEN E.fechaVto2 IS NOT NULL AND P.fecha > E.fechaVto2 
+             THEN '5% (Después 2do vto)'
+    END AS categoríaMora,
+    -- Calcular mora esperada
+    CASE 
+        WHEN P.fecha IS NULL OR P.fecha <= E.fechaVto1 THEN 0
+        WHEN P.fecha > E.fechaVto1 AND (E.fechaVto2 IS NULL OR P.fecha <= E.fechaVto2) 
+             THEN ROUND(0.02 * EC.deuda, 2)
+        WHEN E.fechaVto2 IS NOT NULL AND P.fecha > E.fechaVto2 
+             THEN ROUND(0.05 * EC.deuda, 2)
+    END AS moraEsperada,
+    -- Validar
+    CASE 
+        WHEN EC.interesMora = CASE 
+            WHEN P.fecha IS NULL OR P.fecha <= E.fechaVto1 THEN 0
+            WHEN P.fecha > E.fechaVto1 AND (E.fechaVto2 IS NULL OR P.fecha <= E.fechaVto2) 
+                 THEN ROUND(0.02 * EC.deuda, 2)
+            WHEN E.fechaVto2 IS NOT NULL AND P.fecha > E.fechaVto2 
+                 THEN ROUND(0.05 * EC.deuda, 2)
+        END THEN 'OK'
+        ELSE 'ERROR'
+    END AS validación
 FROM app.Tbl_EstadoCuenta EC
-JOIN app.Tbl_UnidadFuncional UF
-    ON EC.nroUnidadFuncional = UF.idUnidadFuncional
+JOIN app.Tbl_UnidadFuncional UF ON EC.nroUnidadFuncional = UF.idUnidadFuncional
+JOIN app.Tbl_Expensa E ON E.nroExpensa = EC.nroExpensa AND E.idConsorcio = EC.idConsorcio
+LEFT JOIN (
+    SELECT idEstadoCuenta, MAX(fecha) AS fecha
+    FROM app.Tbl_Pago
+    GROUP BY idEstadoCuenta
+) P ON P.idEstadoCuenta = EC.idEstadoCuenta
 WHERE EC.idConsorcio = @idConsFullBC_Test
-  AND EC.nroExpensa = @ExpFeb2025_C1  -- si querés, setealo manualmente con SELECT previo
+  AND EC.nroExpensa = @ExpFeb2025_C1
 ORDER BY UF.piso, UF.departamento;
 
 -- Esperado (mirando las filas):
 --  - PB-A: interesMora = 0
 --  - 1-A: interesMora = 240 (aprox 2% de 12000)
 --  - 3-B: interesMora = 1100 (aprox 5% de 22000)
-
-SELECT * FROM app.Tbl_Expensa WHERE fechaGeneracion = '2025-02-07';
-
-SELECT * FROM app.Tbl_EstadoCuenta;
 
 /* =========================================================
    PRUEBA 6: Pagos registrados (para flujo de caja semanal)
@@ -166,8 +198,8 @@ SELECT
     P.monto,
     P.nroExpensa,
     P.idConsorcio,
-    P.CBU_CVU
-FROM app.Tbl_Pago P
+    seguridad.fn_DesencriptarTexto(P.CBU_CVU_Cifrado) AS CBU_CVU
+FROM app.Tbl_Pago AS P
 WHERE P.idConsorcio = @idConsFullBC_Test
 ORDER BY P.fecha;
 
@@ -181,255 +213,32 @@ ORDER BY P.fecha;
      - Devuelve propietarios vinculados a consorcios de prueba con algún estado de cuenta.
    ========================================================= */
 
-SELECT TOP 5
-    P.apellido,
-    P.nombre,
-    P.dni,
-    P.email,
-    P.telefono,
-    SUM(EC.deuda) AS DeudaTotal
-FROM app.Tbl_Persona P
-JOIN app.Tbl_UFPersona UP ON P.idPersona = UP.idPersona
-JOIN app.Tbl_EstadoCuenta EC ON EC.idConsorcio = UP.idConsorcio
-WHERE UP.esInquilino = 0  -- propietarios
-GROUP BY P.apellido, P.nombre, P.dni, P.email, P.telefono
-ORDER BY DeudaTotal DESC;
-
--- Esperado: algunos propietarios ordenados por deuda total (el grupo después puede ajustar el join si modela propietario/UF de otra forma).
-
-GO
-
-EXEC importacion.Sp_CargarPagosDesdeCsv
-     @rutaArchivo = N'C:\Users\PC\Desktop\consorcios\pagos_banco_lote_pruebas.csv';
-
-GO
-
-CREATE OR ALTER PROCEDURE reportes.Sp_ReporteEstadoFinanciero
-    @Anio        INT,
-    @IdConsorcio INT     = NULL,   -- NULL = todos
-    @MesDesde    TINYINT = 1,      -- 1..12
-    @MesHasta    TINYINT = 12,     -- 1..12
-    @LogPath     NVARCHAR(4000) = NULL,
-    @Verbose     BIT = 0
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @Procedimiento SYSNAME = N'reportes.Sp_ReporteEstadoFinanciero';
-
-    IF @MesDesde < 1 OR @MesDesde > 12
-       OR @MesHasta < 1 OR @MesHasta > 12
-       OR @MesDesde > @MesHasta
-    BEGIN
-        RAISERROR(N'Rango de meses inválido.', 16, 1);
-        RETURN;
-    END;
-
-    IF @Verbose = 1
-        EXEC reportes.Sp_LogReporte
-             @Procedimiento, 'INFO',
-             N'Inicio reporte estado financiero',
-             NULL, NULL, @LogPath;
-
-    ;WITH meses AS (
-        SELECT DISTINCT
-            e.idConsorcio,
-            YEAR(e.fechaGeneracion)  AS Anio,
-            MONTH(e.fechaGeneracion) AS Mes
-        FROM app.Tbl_Expensa e
-        WHERE YEAR(e.fechaGeneracion) = @Anio
-          AND MONTH(e.fechaGeneracion) BETWEEN @MesDesde AND @MesHasta
-          AND (@IdConsorcio IS NULL OR e.idConsorcio = @IdConsorcio)
-    ),
-    base AS (
-        SELECT
-            m.idConsorcio,
-            m.Anio,
-            m.Mes,
-            DATEFROMPARTS(m.Anio, m.Mes, 1)                  AS FechaInicio,
-            EOMONTH(DATEFROMPARTS(m.Anio, m.Mes, 1))         AS FechaFin
-        FROM meses m
-    ),
-    ingresos AS (
-        SELECT
-            b.idConsorcio,
-            b.Anio,
-            b.Mes,
-            -- pagos de expensas del MISMO mes
-            SUM(CASE
-                    WHEN e.fechaGeneracion >= b.FechaInicio
-                     AND e.fechaGeneracion <= b.FechaFin
-                    THEN p.monto ELSE 0
-                END) AS IngresosEnTermino,
-            -- pagos de expensas de meses ANTERIORES (saldo deudor)
-            SUM(CASE
-                    WHEN e.fechaGeneracion < b.FechaInicio
-                    THEN p.monto ELSE 0
-                END) AS IngresosAdeudadas,
-            -- pagos de expensas de meses POSTERIORES (adelantadas)
-            SUM(CASE
-                    WHEN e.fechaGeneracion > b.FechaFin
-                    THEN p.monto ELSE 0
-                END) AS IngresosAdelantadas,
-            -- total ingresos del mes (suma de todo)
-            SUM(p.monto) AS IngresosTotal
-        FROM base b
-        LEFT JOIN app.Tbl_Pago p
-          ON p.idConsorcio = b.idConsorcio
-         AND p.fecha BETWEEN b.FechaInicio AND b.FechaFin
-        LEFT JOIN app.Tbl_Expensa e
-          ON e.nroExpensa   = p.nroExpensa
-         AND e.idConsorcio  = p.idConsorcio
-        GROUP BY
-            b.idConsorcio, b.Anio, b.Mes
-    ),
-    egresos AS (
-        SELECT
-            b.idConsorcio,
-            b.Anio,
-            b.Mes,
-            SUM(g.importe) AS EgresosMes
-        FROM base b
-        LEFT JOIN app.Tbl_Gasto g
-          ON g.idConsorcio  = b.idConsorcio
-         AND g.fechaEmision BETWEEN b.FechaInicio AND b.FechaFin
-        GROUP BY
-            b.idConsorcio, b.Anio, b.Mes
-    ),
-    combinado AS (
-        SELECT
-            b.idConsorcio,
-            b.Anio,
-            b.Mes,
-            ISNULL(i.IngresosTotal,       0) AS IngresosTotal,
-            ISNULL(i.IngresosEnTermino,   0) AS IngresosEnTermino,
-            ISNULL(i.IngresosAdeudadas,   0) AS IngresosAdeudadas,
-            ISNULL(i.IngresosAdelantadas, 0) AS IngresosAdelantadas,
-            ISNULL(e.EgresosMes,          0) AS EgresosMes
-        FROM base b
-        LEFT JOIN ingresos i
-               ON i.idConsorcio = b.idConsorcio
-              AND i.Anio        = b.Anio
-              AND i.Mes         = b.Mes
-        LEFT JOIN egresos e
-               ON e.idConsorcio = b.idConsorcio
-              AND e.Anio        = b.Anio
-              AND e.Mes         = b.Mes
-    ),
-    fin AS (
-        SELECT
-            c.idConsorcio,
-            cs.nombre AS nombreConsorcio,
-            c.Anio,
-            c.Mes,
-            c.IngresosTotal,
-            c.IngresosEnTermino,
-            c.IngresosAdeudadas,
-            c.IngresosAdelantadas,
-            c.EgresosMes,
-            -- saldo acumulado = Σ (ingresos - egresos) hasta ese mes
-            SUM(c.IngresosTotal - c.EgresosMes) OVER (
-                PARTITION BY c.idConsorcio
-                ORDER BY     c.Anio, c.Mes
-            ) AS SaldoAcumulado
-        FROM combinado c
-        JOIN app.Tbl_Consorcio cs
-          ON cs.idConsorcio = c.idConsorcio
-    )
-    SELECT
-        f.idConsorcio,
-        f.nombreConsorcio,
-        f.Anio,
-        f.Mes,
-        -- saldo anterior = saldo acumulado del mes previo
-        LAG(f.SaldoAcumulado, 1, 0) OVER (
-            PARTITION BY f.idConsorcio
-            ORDER BY     f.Anio, f.Mes
-        ) AS SaldoAnterior,
-        f.IngresosEnTermino,
-        f.IngresosAdeudadas,
-        f.IngresosAdelantadas,
-        f.EgresosMes                  AS EgresosGastosMes,
-        f.SaldoAcumulado              AS SaldoAlCierre
-    FROM fin f
-    ORDER BY
-        f.idConsorcio, f.Anio, f.Mes;
-
-    IF @Verbose = 1
-        EXEC reportes.Sp_LogReporte
-             @Procedimiento, 'INFO',
-             N'Fin OK reporte estado financiero',
-             NULL, NULL, @LogPath;
-END
-GO
-
-CREATE OR ALTER PROCEDURE reportes.Sp_ReporteEstadoCuentasProrrateo
-    @IdConsorcio INT     = NULL,
-    @Anio        INT     = NULL,
-    @Mes         TINYINT = NULL,
-    @NroExpensa  INT     = NULL,
-    @LogPath     NVARCHAR(4000) = NULL,
-    @Verbose     BIT     = 0
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @Procedimiento SYSNAME = N'reportes.Sp_ReporteEstadoCuentasProrrateo';
-
-    IF @Verbose = 1
-        EXEC reportes.Sp_LogReporte
-             @Procedimiento, 'INFO',
-             N'Inicio reporte estado de cuentas',
-             NULL, NULL, @LogPath;
-
-    SELECT
-        c.idConsorcio,
-        c.nombre                 AS Consorcio,
-        e.nroExpensa,
-        e.fechaGeneracion,
-        ec.nroUnidadFuncional    AS Uf,
-        uf.porcentaje            AS Porcentaje,
-        uf.piso                  AS Piso,
-        uf.departamento          AS Depto,
-        CASE WHEN ISNULL(uf.metrosCochera, 0) > 0 THEN 1 ELSE 0 END AS Cocheras,
-        CASE WHEN ISNULL(uf.metrosBaulera, 0) > 0 THEN 1 ELSE 0 END AS Bauleras,
-        COALESCE(
-            p.apellido + ', ' + p.nombre,
-            p.nombre,
-            p.apellido
-        )                        AS Propietario,
-        ec.saldoAnterior         AS SaldoAnteriorAbonado,
-        ec.pagoRecibido          AS PagosRecibidos,
-        ec.deuda                 AS Deuda,
-        ec.interesMora           AS InteresMora,
-        ec.expensasOrdinarias    AS ExpensasOrdinarias,
-        ec.expensasExtraordinarias AS ExpensasExtraordinarias,
-        ec.totalAPagar           AS TotalAPagar
-    FROM app.Tbl_EstadoCuenta ec
-    JOIN app.Tbl_UnidadFuncional uf
-      ON uf.idUnidadFuncional = ec.nroUnidadFuncional
-    JOIN app.Tbl_Consorcio c
-      ON c.idConsorcio = ec.idConsorcio
-    JOIN app.Tbl_Expensa e
-      ON e.nroExpensa  = ec.nroExpensa
-     AND e.idConsorcio = ec.idConsorcio
-    LEFT JOIN app.Tbl_Persona p
-      ON p.CBU_CVU = uf.CBU_CVU
-    WHERE (@IdConsorcio IS NULL OR c.idConsorcio = @IdConsorcio)
-      AND (@NroExpensa IS NULL OR e.nroExpensa = @NroExpensa)
-      AND (@Anio IS NULL OR YEAR(e.fechaGeneracion) = @Anio)
-      AND (@Mes  IS NULL OR MONTH(e.fechaGeneracion) = @Mes)
-    ORDER BY
-        c.idConsorcio,
-        e.fechaGeneracion,
-        ec.nroUnidadFuncional;
-
-    IF @Verbose = 1
-        EXEC reportes.Sp_LogReporte
-             @Procedimiento, 'INFO',
-             N'Fin OK reporte estado de cuentas',
-             NULL, NULL, @LogPath;
-END
+;WITH Deudas AS (
+    SELECT 
+        PS.idPersona,
+        SUM(EC.deuda) AS DeudaTotal
+    FROM app.Vw_PersonaSegura AS PS           -- trae dni/email/teléfono desencriptados
+    JOIN app.Tbl_UFPersona AS UP
+        ON UP.idPersona = PS.idPersona
+    JOIN app.Tbl_EstadoCuenta AS EC
+        ON EC.idConsorcio = UP.idConsorcio
+        -- Elegí uno de estos según tu modelo:
+        -- AND EC.idPersona = PS.idPersona              -- si EC referencia a la persona
+        -- AND EC.idUnidadFuncional = UP.idUnidadFuncional -- si EC referencia a la UF
+    WHERE UP.esInquilino = 0  -- propietarios
+    GROUP BY PS.idPersona
+)
+SELECT TOP (5)
+    PS.apellido,
+    PS.nombre,
+    PS.dni,
+    PS.email,
+    PS.telefono,
+    D.DeudaTotal
+FROM Deudas AS D
+JOIN app.Vw_PersonaSegura AS PS
+  ON PS.idPersona = D.idPersona
+ORDER BY D.DeudaTotal DESC;
 GO
 
 DECLARE @idConsFullBC_Test INT;
